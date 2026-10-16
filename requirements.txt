@@ -1,0 +1,2 @@
+# Saf Python standart kütüphaneleri kullanıldığı için ek paket gerekmez
+requests>=2.31.0
