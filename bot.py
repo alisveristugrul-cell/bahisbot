@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Set, Union
 
-from data_fetcher import GlobalMatchDataFetcher
+from data_fetcher import GlobalMatchDataFetcher, _normalize_team_name
 from strategy_engine import MatchQuantitativeAnalyzer
 
 
@@ -44,7 +44,10 @@ def _safe_html(text: Any) -> str:
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-SUBSCRIBERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "subscribers.json")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+SUBSCRIBERS_PATH = os.path.join(CACHE_DIR, "subscribers.json")
+PREDICTIONS_PATH = os.path.join(CACHE_DIR, "predictions_record.json")
+VIP_CHANNEL_PATH = os.path.join(CACHE_DIR, "vip_channel.txt")
 
 
 def load_bot_token() -> str:
@@ -62,12 +65,106 @@ def load_bot_token() -> str:
     return ""
 
 
+class PredictionTracker:
+    """Botun önerdiği kupon ve maçları kaydedip sonuçlarını otomatik puanlayan takip motoru."""
+
+    def __init__(self):
+        self.path = PREDICTIONS_PATH
+        self._records: List[Dict[str, Any]] = self._load()
+
+    def _load(self) -> List[Dict[str, Any]]:
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return []
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._records[-500:], f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def record_picks(self, coupon_title: str, picks: List[Dict[str, Any]]) -> None:
+        now_ts = time.time()
+        existing_ids = {r.get("id") for r in self._records}
+        for p in picks:
+            p_id = f"{p['match']}__{p['pick']}"
+            if p_id not in existing_ids:
+                self._records.append({
+                    "id": p_id,
+                    "coupon": coupon_title,
+                    "match": p["match"],
+                    "time": p.get("time", ""),
+                    "pick": p["pick"],
+                    "odd": float(p.get("odd", 1.0)),
+                    "prob": float(p.get("prob", 50.0)),
+                    "recorded_at": now_ts,
+                    "status": "PENDING",
+                    "final_score": None,
+                })
+                existing_ids.add(p_id)
+        self._save()
+
+    def update_with_results(self, finished_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """Bitmiş maç skorlarıyla bekleyen kupon tahminlerini puanlar."""
+        for r in self._records:
+            if r["status"] != "PENDING":
+                continue
+            m_str = r["match"]
+            parts = m_str.split(" - ", 1) if " - " in m_str else m_str.split(" vs ", 1)
+            if len(parts) < 2:
+                continue
+            h_norm = _normalize_team_name(parts[0])
+            a_norm = _normalize_team_name(parts[1])
+
+            fin = (
+                finished_map.get(f"{h_norm}__{a_norm}")
+                or finished_map.get(h_norm)
+                or finished_map.get(a_norm)
+            )
+            if fin and fin.get("home_goals") is not None and fin.get("away_goals") is not None:
+                hg, ag = fin["home_goals"], fin["away_goals"]
+                is_win = MatchQuantitativeAnalyzer.evaluate_pick(r["pick"], hg, ag)
+                r["status"] = "WON" if is_win else "LOST"
+                r["final_score"] = f"{hg}-{ag}"
+
+        self._save()
+
+        # Karne İstatistiklerini Çıkar
+        evaluated = [r for r in self._records if r["status"] in ("WON", "LOST")]
+        won = [r for r in evaluated if r["status"] == "WON"]
+        lost = [r for r in evaluated if r["status"] == "LOST"]
+        pending = [r for r in self._records if r["status"] == "PENDING"]
+
+        win_rate = (len(won) / len(evaluated) * 100) if evaluated else 0.0
+
+        # Kasa Getirisi (ROI)
+        total_staked = len(evaluated) * 100
+        total_returned = sum(r["odd"] * 100 for r in won)
+        roi_pct = ((total_returned - total_staked) / total_staked * 100) if total_staked > 0 else 0.0
+
+        return {
+            "total_evaluated": len(evaluated),
+            "won_count": len(won),
+            "lost_count": len(lost),
+            "pending_count": len(pending),
+            "win_rate": round(win_rate, 1),
+            "roi_pct": round(roi_pct, 1),
+            "recent": evaluated[-5:],
+        }
+
+
 class BettingBotFormatter:
     """Tahminleri, maç analizlerini ve kuponları Telegram/Terminal için şık formatta üretir."""
 
     def __init__(self, fetcher: GlobalMatchDataFetcher, analyzer: MatchQuantitativeAnalyzer):
         self.fetcher = fetcher
         self.analyzer = analyzer
+        self.tracker = PredictionTracker()
         self._matches_cache: List[Dict[str, Any]] = []
         self._last_load_ts: float = 0.0
         self._coupons_cache: Optional[Dict[str, Any]] = None
@@ -90,6 +187,9 @@ class BettingBotFormatter:
             matches = self.get_matches(force_refresh=force_refresh)
             self._coupons_cache = self.analyzer.build_smart_coupons(matches)
             self._last_coupons_ts = now
+            for k, c in self._coupons_cache.items():
+                if isinstance(c, dict) and "picks" in c:
+                    self.tracker.record_picks(c.get("title", k), c["picks"])
         return self._coupons_cache
 
     def format_strategy_picks(self, strategy_key: str, top_n: int = 5) -> str:
@@ -304,6 +404,266 @@ class BettingBotFormatter:
 
         return ["\n".join(p1_lines), "\n".join(p2_lines)]
 
+    def format_scorecard(self) -> str:
+        """Kupon ve tahminlerin geçmiş başarı/karne raporunu oluşturur."""
+        scores_data = self.fetcher.fetch_mackolik_scores()
+        fin_map = scores_data.get("finished", {})
+        stats = self.tracker.update_with_results(fin_map)
+
+        total_ev = stats["total_evaluated"]
+        won_cnt = stats["won_count"]
+        lost_cnt = stats["lost_count"]
+        pending_cnt = stats["pending_count"]
+        win_rate = stats["win_rate"]
+        roi = stats["roi_pct"]
+
+        lines = [
+            "📊 <b>BOT TAHMİN & KUPON BAŞARI KARNESİ (TRACK RECORD)</b>",
+            "<i>Modelin önerdiği tüm kupon ve maçlar otomatik takip edilir, maç sonu skorlarıyla doğrulanır:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"📈 <b>Toplam Değerlendirilen Tercih:</b> {total_ev} Maç",
+            f"✅ <b>Tutan Tahminler:</b> {won_cnt} Maç",
+            f"❌ <b>Yatan Tahminler:</b> {lost_cnt} Maç",
+            f"🎯 <b>Genel İsabet Oranı:</b> %{win_rate:.1f}",
+            f"💰 <b>Net Kasa Getirisi (ROI):</b> %{roi:+.1f}",
+            f"⏳ <b>Devam Eden / Sonuç Bekleyen:</b> {pending_cnt} Maç",
+            "──────────────────────",
+        ]
+
+        recent = stats.get("recent", [])
+        if recent:
+            lines.append("🏁 <b>Sonuçlanan Son Maçlar:</b>")
+            for r in recent[-6:]:
+                emoji = "✅" if r["status"] == "WON" else "❌"
+                sc = r.get("final_score") or "-"
+                lines.append(f"  {emoji} <b>{_safe_html(r['match'])}</b> ({sc}) ➔ {_safe_html(r['pick'])} @ {r['odd']:.2f}")
+            lines.append("──────────────────────")
+        else:
+            lines.append("💡 <i>Henüz sonuçlanmış kayıtlı maç yok. Yeni kuponlar oluştukça maçlar bittikçe karne otomatik güncellenir.</i>\n──────────────────────")
+
+        lines.append("📌 <i>Not: ROI hesabı her maça eşit 100 birim sabit kasa bahsi (flat betting) baz alınarak yapılmıştır.</i>")
+        return "\n".join(lines)
+
+    def format_dropping_odds(self) -> str:
+        """Piyasada sert oran düşüşü yaşayan akıllı para maçlarını listeler."""
+        # Bülteni tazeleyip oran geçmişini tara
+        self.get_matches()
+        drops = self.fetcher.get_dropping_odds(min_drop_pct=0.08)
+        lines = [
+            "📉 <b>PİYASA ORAN DÜŞÜŞ RADARI (SMART MONEY / AKILLI PARA)</b>",
+            "<i>Bülten açılışından itibaren en az %8+ oran düşüşü yaşayan ve piyasanın yüklendiği maçlar:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if not drops:
+            lines.append("⚠️ <b>Son taramada %8 üzeri sert oran düşüşü yaşayan yeni maç tespit edilmedi.</b>\nOran hareketleri bülten yenilendikçe otomatik analiz edilir.")
+            return "\n".join(lines)
+
+        for idx, d in enumerate(drops[:8], 1):
+            lines.append(
+                f"<b>{idx}. ⚽ {_safe_html(d['match'])}</b> ({d['time']})\n"
+                f"   🏆 {_safe_html(d['league'])}\n"
+                f"   🎯 <b>Market:</b> {_safe_html(d['market_name'])}\n"
+                f"   📉 <b>Oran Değişimi:</b> <s>{d['initial_odd']:.2f}</s> ➔ <b>{d['current_odd']:.2f}</b> (<b>-%{d['drop_pct']:.1f}</b> Düşüş)\n"
+                f"   💡 <i>Piyasa bu tercihin riskini görerek oranı aşağı çekti (Akıllı para akışı).</i>"
+            )
+            lines.append("──────────────────────")
+
+        lines.append("⚠️ <i>Taktik: Oranı sert düşen maçları tekli veya 2'li kombinelerde değerlendirmeniz önerilir.</i>")
+        return "\n".join(lines)
+
+    def format_live_radar(self) -> str:
+        """Devam eden canlı maçlar arasından oyun içi (In-Play) gol fırsatlarını listeler."""
+        live_data = self.fetcher.fetch_mackolik_scores()
+        live_matches = live_data.get("live", [])
+        pre_matches = self.get_matches()
+        opps = self.analyzer.scan_live_opportunities(live_matches, pre_matches)
+
+        lines = [
+            "🔴 <b>CANLI MAÇ OYUN İÇİ (IN-PLAY) FIRSAT RADARI</b>",
+            f"<i>Şu an anlık oynanan <b>{len(live_matches)}</b> canlı maç maç öncesi xG & tempo modelleriyle tarandı:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if not opps:
+            lines.append(
+                "⚠️ <b>Şu an canlıda model kriterlerine uyan aktif fırsat yok.</b>\n"
+                f"• Anlık izlenen canlı maç sayısı: <b>{len(live_matches)}</b>\n"
+                "• Radar; maç öncesi gol beklentisi yüksek olup 40. dakikadan sonra kilitlenen maçları ve geriye düşen favorileri otomatik yakalar.\n"
+                "• Yoğun maç saatlerinde tekrar deneyin."
+            )
+            return "\n".join(lines)
+
+        for idx, o in enumerate(opps[:6], 1):
+            lines.append(
+                f"<b>{idx}. 🔴 {_safe_html(o['match'])}</b> ({o['status']})\n"
+                f"   🏆 {_safe_html(o['league'])}\n"
+                f"   🎯 <b>Canlı Sinyal:</b> <b>{_safe_html(o['opportunity_type'])}</b>\n"
+                f"   📈 <b>Model Güveni:</b> %{o['confidence']:.1f} (xG: {o['expected_goals']:.2f})\n"
+                f"   💡 <i>{_safe_html(o['reason'])}</i>"
+            )
+            lines.append("──────────────────────")
+
+        lines.append("⚡ <i>Canlı bahiste oranlar dakikalar içinde değiştiğinden hızlı aksiyon önemlidir.</i>")
+        return "\n".join(lines)
+
+    def format_wizard_coupon(self, match_count: int = 3, min_odd: float = 2.0, max_odd: float = 6.0, risk_level: str = "ideal") -> str:
+        """Kullanıcının tercihine göre kişiselleştirilmiş sihirbaz kuponu oluşturur."""
+        matches = self.get_matches()
+        c = self.analyzer.build_custom_wizard_coupon(
+            matches=matches,
+            match_count=match_count,
+            min_total_odd=min_odd,
+            max_total_odd=max_odd,
+            risk_level=risk_level,
+        )
+
+        lines = [
+            f"🧙‍♂️ <b>{_safe_html(c['title'])}</b>",
+            f"<i>Parametreler: {match_count} Maç | Hedef Oran: {min_odd:.2f} - {max_odd:.2f} | Risk: {risk_level.capitalize()}</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        picks = c.get("picks", [])
+        if not picks:
+            lines.append("⚠️ Belirtilen kriterlere uygun maç kombinasyonu bulunamadı.")
+            return "\n".join(lines)
+
+        for idx, p in enumerate(picks, 1):
+            lines.append(
+                f"  {idx}) <b>{_safe_html(p['match'])}</b> ({p['time']})\n"
+                f"     👉 <b>{_safe_html(p['pick'])}</b> | Oran: <b>{p['odd']:.2f}</b> (Model: %{p['prob']:.1f})\n"
+                f"     📌 <i>{_safe_html(p['reason'])}</i>"
+            )
+        lines.append(f"🔥 <b>Toplam Kupon Oranı: {c['total_odd']:.2f}</b>")
+        lines.append("──────────────────────")
+        lines.append(
+            "💡 <i>Farklı kriterlerle denemek için: <code>/sihirbaz mac=4 oran=3-8 risk=garanti</code> yazabilirsiniz.</i>"
+        )
+        return "\n".join(lines)
+
+    def format_trap_radar(self) -> str:
+        """Piyasanın favoriye yüklendiği ama modelin yüksek patlama tehlikesi gördüğü tuzak maçları listeler."""
+        matches = self.get_matches()
+        traps = self.analyzer.scan_trap_matches(matches, top_n=5)
+
+        lines = [
+            "⚠️ <b>TERS KÖŞE & TUZAK MAÇ RADARI (ANTI-TRAP / RLM)</b>",
+            "<i>Halkın ve kamuoyunun favoriye aşırı yüklendiği ancak modelin patlama riski gördüğü maçlar:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if not traps:
+            lines.append("🛡️ <b>Şu anki bültende keskin bir 'Favori Tuzağı' sinyali tespit edilmedi.</b>")
+            lines.append("Bültendeki favoriler model beklentileriyle makul uyum içinde görünüyor.")
+            return "\n".join(lines)
+
+        for idx, t in enumerate(traps, 1):
+            m = t["match"]
+            lines.append(
+                f"{idx}) 🚨 <b>{_safe_html(m['home'])} - {_safe_html(m['away'])}</b> ({m.get('time', '')})\n"
+                f"   👑 <b>Ağır Favori:</b> {_safe_html(t['favorite'])} (Oran: <b>{t['favorite_odd']:.2f}</b>)\n"
+                f"   💣 <b>Tuzak Skoru:</b> {t['trap_score']}/100 ({t['danger_level']})\n"
+                f"   📊 <b>Piyasa Beklentisi:</b> %{t['implied_market_prob']:.1f} ➔ <b>Model Güveni:</b> %{t['model_prob']:.1f}\n"
+                f"   💡 <b>Risk Sebebi:</b> <i>{_safe_html(t['reasons'][0])}</i>\n"
+                f"   🛡️ <b>Anti-Tuzak Önerisi:</b> 👉 <b>{_safe_html(t['anti_pick'])}</b>"
+            )
+            lines.append("──────────────────────")
+
+        lines.append("💡 <i>Kupon yaparken oranına aldanıp doğrudan favoriye girmemek kasanızı korur!</i>")
+        return "\n".join(lines)
+
+    def format_tension_radar(self) -> str:
+        """Derbi, sert lig mücadeleleri ve yüksek kart/korner tansiyonlu maçları listeler."""
+        matches = self.get_matches()
+        tensions = self.analyzer.scan_tension_matches(matches, top_n=5)
+
+        lines = [
+            "🟨 <b>HAKEM & MAÇ TANSİYON RADARI (KART & KORNER)</b>",
+            "<i>Yüksek rekabetli, sert ikili mücadele ve kart baskısı tavan maçlar:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if not tensions:
+            lines.append("⚖️ Şu an bültende belirgin yüksek tansiyon veya derbi gerginliği sinyali yok.")
+            return "\n".join(lines)
+
+        for idx, ten in enumerate(tensions, 1):
+            m = ten["match"]
+            lines.append(
+                f"{idx}) 🔥 <b>{_safe_html(m['home'])} - {_safe_html(m['away'])}</b> ({m.get('time', '')})\n"
+                f"   🏆 <b>Lig:</b> {_safe_html(ten['league'])}\n"
+                f"   ⚔️ <b>Tansiyon Skoru:</b> {ten['tension_score']}/100\n"
+                f"   🟨 <b>Beklenen Kart:</b> <b>{ten['expected_cards']} Kart</b> (Model: %{ten['card_prob']:.1f})\n"
+                f"   📐 <b>Beklenen Korner:</b> <b>{ten['expected_corners']} Korner</b>\n"
+                f"   🔴 <b>Kırmızı Kart İhtimali:</b> %{ten['red_card_risk']:.1f} (Yüksek Tehdit!)\n"
+                f"   👉 <b>Tavsiye Tercih:</b> <b>{ten['card_pick']}</b> veya <b>{ten['corner_pick']}</b>"
+            )
+            lines.append("──────────────────────")
+
+        lines.append("💡 <i>Kart ve korner bahisleri hakem ve lig sertliği modelleriyle en yüksek başarı getiren alanlardandır.</i>")
+        return "\n".join(lines)
+
+    def format_monte_carlo(self, query: str = "") -> str:
+        """Dixon-Coles xG olasılıklarıyla maçı 10.000 kez bilgisayarda simüle eder."""
+        matches = self.get_matches()
+        if not matches:
+            return "⚠️ Bültende simülasyon yapılacak maç bulunamadı."
+
+        selected_match = None
+        if query.strip():
+            q = query.strip().lower()
+            found = [m for m in matches if q in m["home"].lower() or q in m["away"].lower() or q == m.get("code")]
+            if found:
+                selected_match = found[0]
+
+        if not selected_match:
+            selected_match = matches[0]
+
+        sim = self.analyzer.run_monte_carlo_simulation(selected_match, n_sims=10000)
+
+        lines = [
+            "🎲 <b>MONTE CARLO 10.000 MAÇ SİMÜLASYONU</b>",
+            f"⚽ <b>{_safe_html(sim['home'])} vs {_safe_html(sim['away'])}</b>",
+            f"🏆 {_safe_html(sim['league'])} | 🕒 {sim['date']} {sim['time']}",
+            "<i>Bu maç Poisson & Dixon-Coles xG dağılımıyla tam 10.000 kez sanal olarak oynatıldı:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "📊 <b>10.000 Simülasyon Galibiyet Dağılımı:</b>",
+            f"  • 🏠 Ev Sahibi Galibiyeti: <b>%{sim['home_win_pct']:.1f}</b> ({int(sim['home_win_pct'] * 100)} maç)",
+            f"  • 🤝 Beraberlik: <b>%{sim['draw_pct']:.1f}</b> ({int(sim['draw_pct'] * 100)} maç)",
+            f"  • ✈️ Deplasman Galibiyeti: <b>%{sim['away_win_pct']:.1f}</b> ({int(sim['away_win_pct'] * 100)} maç)",
+            "──────────────────────",
+            "⚽ <b>Gol Limitleri & Karşılıklı Gol:</b>",
+            f"  • 1.5 Gol Üst: <b>%{sim['over_15_pct']:.1f}</b>",
+            f"  • 2.5 Gol Üst: <b>%{sim['over_25_pct']:.1f}</b>",
+            f"  • 3.5 Gol Üst: <b>%{sim['over_35_pct']:.1f}</b>",
+            f"  • KG Var (İki Takım da Attı): <b>%{sim['btts_pct']:.1f}</b>",
+            f"  • Simüle Edilen Maç Başı Ortalama Gol: <b>{sim['avg_goals']:.2f} Gol</b>",
+            "──────────────────────",
+            "🎯 <b>10.000 Maçta En Sık Çıkan 5 Kesin Skor:</b>",
+        ]
+        for idx, sc in enumerate(sim["top_scores"], 1):
+            lines.append(f"  {idx}) <b>{sc['score']}</b> ➔ {sc['count']} kez (<b>%{sc['pct']:.1f}</b> frekans)")
+
+        lines.append("──────────────────────")
+        lines.append(
+            "💡 <i>Farklı bir maçı simüle etmek için: <code>/simulasyon TakımAdı</code> yazabilirsiniz (Örn: <code>/simulasyon Chelsea</code>).</i>"
+        )
+        return "\n".join(lines)
+
+    def format_vip_broadcast(self) -> List[str]:
+        """VIP Kanallar ve Gruplar için şık, profesyonel günlük bülten ve kupon paketi hazırlar."""
+        coupons = self.format_coupons()
+        trap_radar = self.format_trap_radar()
+
+        header = (
+            "💎👑 <b>GLOBAL QUANT VIP GÜNLÜK BAHİS BÜLTENİ</b> 👑💎\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📅 <b>Bugünün Dixon-Coles 9x9 & Sharp Value Analiz Raporu</b>\n"
+            "Algoritmamız global bültendeki tüm maçları tarayarak en yüksek kazanma beklentisine sahip "
+            "banko, değerli (+EV) ve sürpriz kombinasyonları hazırladı.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        part1 = f"{header}\n\n{coupons[0] if isinstance(coupons, list) else coupons}"
+        part2 = f"⚠️ <b>GÜNÜN TUZAK VE TERS KÖŞE UYARILARI:</b>\n{trap_radar}"
+        return [part1, part2]
+
     def format_match_xray(self, query: str) -> str:
         query_clean = query.strip().lower()
         if not query_clean:
@@ -425,6 +785,22 @@ class TelegramBettingBot:
             {"text": "💰 Akıllı Kasa Dağıtımı", "callback_data": "action:kasa"},
         ],
         [
+            {"text": "🔴 Canlı Fırsat Radarı (In-Play)", "callback_data": "action:live_radar"},
+            {"text": "📉 Oran Düşüşü (Smart Money)", "callback_data": "action:dropping"},
+        ],
+        [
+            {"text": "🧙‍♂️ Akıllı Kupon Sihirbazı", "callback_data": "action:wizard"},
+            {"text": "📊 Başarı Karnesi & ROI", "callback_data": "action:scorecard"},
+        ],
+        [
+            {"text": "⚠️ Tuzak Maç Radarı", "callback_data": "action:trap"},
+            {"text": "🟨 Tansiyon & Kart Radarı", "callback_data": "action:tension"},
+        ],
+        [
+            {"text": "🎲 Monte Carlo 10K Simülasyon", "callback_data": "action:monte_carlo"},
+            {"text": "📢 Günlük VIP Bülten", "callback_data": "action:vip_broadcast"},
+        ],
+        [
             {"text": "⏱️ Önümüzdeki 4 Saat Kuponları", "callback_data": "action:upcoming_4h"},
         ],
         [
@@ -446,6 +822,24 @@ class TelegramBettingBot:
         self.offset = 0
         self.subscribers: Set[int] = self._load_subscribers()
         self.sent_alerts: Set[str] = set()
+        self.vip_channel_id: Optional[str] = os.environ.get("VIP_CHANNEL_ID") or self._load_vip_channel()
+
+    def _load_vip_channel(self) -> Optional[str]:
+        if os.path.exists(VIP_CHANNEL_PATH):
+            try:
+                with open(VIP_CHANNEL_PATH, "r", encoding="utf-8") as f:
+                    v = f.read().strip()
+                    return v if v else None
+            except Exception:
+                pass
+        return None
+
+    def _save_vip_channel(self, channel_id: str) -> None:
+        try:
+            with open(VIP_CHANNEL_PATH, "w", encoding="utf-8") as f:
+                f.write(channel_id.strip())
+        except Exception:
+            pass
 
     def _load_subscribers(self) -> Set[int]:
         if os.path.exists(SUBSCRIBERS_PATH):
@@ -563,6 +957,14 @@ class TelegramBettingBot:
                 "<b>Inverse Multi-Market Poisson (xG)</b>, <b>Half-Split Tempo</b> ve "
                 "<b>Sharp Value (+EV)</b> modelleriyle tarar.\n\n"
                 "👇 <b>Aşağıdaki butonlardan istediğiniz taktiği seçebilir veya komutları kullanabilirsiniz:</b>\n"
+                "• <code>/canli</code> — 🔴 Canlı Fırsat Radarı (In-Play Gol & Baskı Takibi)\n"
+                "• <code>/dusen</code> — 📉 Oran Düşüşü (Smart Money & Para Akışı)\n"
+                "• <code>/sihirbaz</code> — 🧙‍♂️ Akıllı Kupon Sihirbazı (Örn: <code>/sihirbaz mac=4 oran=3-8 risk=garanti</code>)\n"
+                "• <code>/karne</code> — 📊 Model Başarı Karnesi & ROI Takibi\n"
+                "• <code>/tuzak</code> — ⚠️ Ters Köşe & Tuzak Maç Radarı (Anti-Trap)\n"
+                "• <code>/tansiyon</code> — 🟨 Hakem & Maç Tansiyon Radarı (Kart & Korner)\n"
+                "• <code>/simulasyon &lt;takım&gt;</code> — 🎲 Monte Carlo 10.000 Simülasyon\n"
+                "• <code>/yayinla</code> — 📢 Günlük VIP Bülteni Kanala/Sohbete Yayınla\n"
                 "• <code>/4saat</code> — ⏱️ Önümüzdeki 4 Saatin Maçları (Garantiden Riskliye)\n"
                 "• <code>/kupon</code> — 🎫 5 Kademeli Günlük Kupon (Garanti ➔ Bomba)\n"
                 "• <code>/sistem</code> — 🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)\n"
@@ -579,6 +981,7 @@ class TelegramBettingBot:
                 "• <code>/tgaralik</code> — ⚖️ 2-3 Gol & 4-5 Gol Aralığı\n"
                 "• <code>/value</code> — 🧠 Oran Sapması (+EV) Value Bet\n"
                 "• <code>/analiz TakımAdı</code> — 🔬 Maç X-Ray Analizi (Örn: <code>/analiz Chelsea</code>)\n"
+                "• <code>/kanal &lt;ID&gt;</code> — 📡 VIP Yayın Kanalı Belirle (Örn: <code>/kanal @Kanalim</code>)\n"
                 "• <code>/oto_ac</code> / <code>/oto_kapat</code> — 🔔 Otomatik Fırsat Bildirimi"
             )
             self.send_message(chat_id, welcome, show_menu=True)
@@ -586,6 +989,91 @@ class TelegramBettingBot:
         elif cmd in cmd_map:
             reply = self.formatter.format_strategy_picks(cmd_map[cmd])
             self.send_message(chat_id, reply, show_menu=True)
+
+        elif cmd in ("/canli", "/live"):
+            self.send_message(chat_id, self.formatter.format_live_radar(), show_menu=True)
+
+        elif cmd in ("/dusen", "/dropping"):
+            self.send_message(chat_id, self.formatter.format_dropping_odds(), show_menu=True)
+
+        elif cmd in ("/karne", "/performans", "/rapor"):
+            self.send_message(chat_id, self.formatter.format_scorecard(), show_menu=True)
+
+        elif cmd in ("/tuzak", "/trap"):
+            self.send_message(chat_id, self.formatter.format_trap_radar(), show_menu=True)
+
+        elif cmd in ("/tansiyon", "/hakem", "/kartlar"):
+            self.send_message(chat_id, self.formatter.format_tension_radar(), show_menu=True)
+
+        elif cmd in ("/simulasyon", "/montecarlo", "/mc"):
+            self.send_message(chat_id, self.formatter.format_monte_carlo(arg), show_menu=True)
+
+        elif cmd in ("/yayinla", "/vip"):
+            broadcast_content = self.formatter.format_vip_broadcast()
+            self.send_message(chat_id, broadcast_content, show_menu=True)
+            if self.vip_channel_id:
+                try:
+                    target_ch = int(self.vip_channel_id) if (self.vip_channel_id.startswith("-") or self.vip_channel_id.isdigit()) else self.vip_channel_id
+                    self.send_message(target_ch, broadcast_content, show_menu=False)
+                    self.send_message(chat_id, f"✅ VIP Günlük Bülten <b>{self.vip_channel_id}</b> kanalına başarıyla yayınlandı!", show_menu=False)
+                except Exception as e:
+                    self.send_message(chat_id, f"⚠️ VIP Kanala yayınlanırken hata oluştu: <code>{e}</code>", show_menu=False)
+            else:
+                self.send_message(chat_id, "💡 <i>Kalıcı bir VIP kanala otomatik yayınlamak için: <code>/kanal @KanalKullaniciAdi</code> komutunu kullanabilirsiniz.</i>", show_menu=False)
+
+        elif cmd == "/kanal":
+            if not arg.strip():
+                cur = self.vip_channel_id or "Ayarlanmadı"
+                self.send_message(chat_id, f"📡 <b>Mevcut VIP Yayın Kanalı:</b> <code>{cur}</code>\n\nDeğiştirmek için: <code>/kanal @KanalKullaniciAdi</code> veya <code>/kanal -100xxxxxxxx</code> yazabilirsiniz.", show_menu=True)
+            else:
+                ch = arg.strip()
+                self.vip_channel_id = ch
+                self._save_vip_channel(ch)
+                self.send_message(chat_id, f"✅ <b>VIP Kanal Kaydedildi:</b> <code>{ch}</code>\nArtık <code>/yayinla</code> komutu bülteni doğrudan bu kanala da ulaştıracak.", show_menu=True)
+
+        elif cmd in ("/sihirbaz", "/wizard"):
+            match_count = 3
+            min_odd = 2.0
+            max_odd = 6.0
+            risk_level = "ideal"
+            if arg:
+                for token in arg.split():
+                    t_lower = token.lower()
+                    if t_lower.startswith("mac="):
+                        val = t_lower.replace("mac=", "")
+                        if val.isdigit():
+                            match_count = int(val)
+                    elif t_lower.startswith("oran="):
+                        val = t_lower.replace("oran=", "")
+                        if "-" in val:
+                            p_o = val.split("-")
+                            try:
+                                min_odd = float(p_o[0])
+                                max_odd = float(p_o[1])
+                            except ValueError:
+                                pass
+                        else:
+                            try:
+                                max_odd = float(val)
+                                min_odd = max(1.5, max_odd * 0.7)
+                            except ValueError:
+                                pass
+                    elif t_lower.startswith("risk="):
+                        val = t_lower.replace("risk=", "")
+                        if val in ("garanti", "ideal", "surpriz", "bomba"):
+                            risk_level = val
+                    elif token.isdigit():
+                        match_count = int(token)
+            self.send_message(
+                chat_id,
+                self.formatter.format_wizard_coupon(
+                    match_count=match_count,
+                    min_odd=min_odd,
+                    max_odd=max_odd,
+                    risk_level=risk_level,
+                ),
+                show_menu=True,
+            )
 
         elif cmd in ("/4saat", "/yaklasan"):
             self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=4), show_menu=True)
@@ -663,6 +1151,15 @@ class TelegramBettingBot:
     def _register_bot_commands(self) -> None:
         commands = [
             {"command": "menu", "description": "📋 İnteraktif Taktik & Analiz Menüsü"},
+            {"command": "canli", "description": "🔴 Canlı Fırsat Radarı (In-Play Sniping)"},
+            {"command": "dusen", "description": "📉 Oran Düşüşü & Smart Money Takibi"},
+            {"command": "sihirbaz", "description": "🧙‍♂️ Akıllı Kupon Sihirbazı (Örn: /sihirbaz mac=4 oran=3-8)"},
+            {"command": "karne", "description": "📊 Model Başarı Karnesi & ROI Performansı"},
+            {"command": "tuzak", "description": "⚠️ Ters Köşe & Tuzak Maç Radarı"},
+            {"command": "tansiyon", "description": "🟨 Hakem & Tansiyon Radarı (Kart & Korner)"},
+            {"command": "simulasyon", "description": "🎲 Monte Carlo 10.000 Simülasyon"},
+            {"command": "yayinla", "description": "📢 Günlük VIP Bülteni Kanala/Sohbete Yayınla"},
+            {"command": "kanal", "description": "📡 VIP Yayın Kanalı Belirle (/kanal @KanalAdi)"},
             {"command": "4saat", "description": "⏱️ Önümüzdeki 4 Saatin Kuponları (Garantiden Riskliye)"},
             {"command": "kupon", "description": "🎫 5 Kademeli Günlük Kuponlar (Garanti ➔ Bomba)"},
             {"command": "sistem", "description": "🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)"},
@@ -766,6 +1263,22 @@ class TelegramBettingBot:
                             s_key = data.split(":", 1)[1]
                             reply = self.formatter.format_strategy_picks(s_key)
                             self.send_message(chat_id, reply, show_menu=True)
+                        elif data == "action:live_radar":
+                            self.send_message(chat_id, self.formatter.format_live_radar(), show_menu=True)
+                        elif data == "action:dropping":
+                            self.send_message(chat_id, self.formatter.format_dropping_odds(), show_menu=True)
+                        elif data == "action:wizard":
+                            self.send_message(chat_id, self.formatter.format_wizard_coupon(), show_menu=True)
+                        elif data == "action:scorecard":
+                            self.send_message(chat_id, self.formatter.format_scorecard(), show_menu=True)
+                        elif data == "action:trap":
+                            self.send_message(chat_id, self.formatter.format_trap_radar(), show_menu=True)
+                        elif data == "action:tension":
+                            self.send_message(chat_id, self.formatter.format_tension_radar(), show_menu=True)
+                        elif data == "action:monte_carlo":
+                            self.send_message(chat_id, self.formatter.format_monte_carlo(), show_menu=True)
+                        elif data == "action:vip_broadcast":
+                            self.handle_command(chat_id, "/yayinla")
                         elif data == "action:upcoming_4h":
                             self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=4), show_menu=True)
                         elif data == "action:coupons":

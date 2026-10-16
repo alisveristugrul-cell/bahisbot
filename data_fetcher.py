@@ -507,7 +507,162 @@ class GlobalMatchDataFetcher:
 
         # En yakın başlayan maçlar önce (gerçek tarih-saate göre)
         matches.sort(key=lambda x: (x["start_dt"], x["league_order"]))
+        self._update_odds_history(matches)
         return matches[:max_matches]
+
+    ODDS_HISTORY_PATH = os.path.join(CACHE_DIR, "odds_history.json")
+
+    def _update_odds_history(self, matches: List[Dict[str, Any]]) -> None:
+        """Her bülten çekilişinde oranların anlık değişimini kaydeder."""
+        history: Dict[str, Any] = {}
+        if os.path.exists(self.ODDS_HISTORY_PATH):
+            try:
+                with open(self.ODDS_HISTORY_PATH, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = {}
+
+        now_ts = time.time()
+        for m in matches:
+            code = m["code"]
+            curr_odds = m["odds"]
+            if not code or not curr_odds:
+                continue
+
+            if code not in history:
+                history[code] = {
+                    "first_seen": now_ts,
+                    "home": m["home"],
+                    "away": m["away"],
+                    "league": m["league"],
+                    "time": f"{m['date']} {m['time']}",
+                    "initial_odds": curr_odds,
+                    "latest_odds": curr_odds,
+                }
+            else:
+                history[code]["latest_odds"] = curr_odds
+
+        # 1000 maçtan fazlasını saklayıp şişirmemek için temizle
+        if len(history) > 1000:
+            keys_to_keep = list(history.keys())[-750:]
+            history = {k: history[k] for k in keys_to_keep}
+
+        try:
+            with open(self.ODDS_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def get_dropping_odds(self, min_drop_pct: float = 0.08) -> List[Dict[str, Any]]:
+        """
+        Bülten açılışından itibaren en az min_drop_pct (%8+) oran düşüşü yaşayan
+        ve piyasa / akıllı para (Smart Money) ilgisi çeken maçları bulur.
+        """
+        if not os.path.exists(self.ODDS_HISTORY_PATH):
+            return []
+
+        try:
+            with open(self.ODDS_HISTORY_PATH, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception:
+            return []
+
+        drops = []
+        market_labels = {
+            "ms_1": "MS 1 (Ev Sahibi)",
+            "ms_2": "MS 2 (Deplasman)",
+            "ms_x": "MS X (Beraberlik)",
+            "ust_25": "2.5 Gol Üst",
+            "alt_25": "2.5 Gol Alt",
+            "kg_var": "KG Var",
+            "kg_yok": "KG Yok",
+            "iy_ust_15": "İlk Yarı 1.5 Üst",
+        }
+
+        for code, entry in history.items():
+            init_odds = entry.get("initial_odds", {})
+            latest_odds = entry.get("latest_odds", {})
+            for m_key, label in market_labels.items():
+                i_val = init_odds.get(m_key)
+                l_val = latest_odds.get(m_key)
+                if i_val and l_val and isinstance(i_val, (int, float)) and isinstance(l_val, (int, float)):
+                    if i_val > 1.25 and l_val < i_val:
+                        drop_ratio = (i_val - l_val) / i_val
+                        if drop_ratio >= min_drop_pct:
+                            drops.append({
+                                "code": code,
+                                "match": f"{entry['home']} - {entry['away']}",
+                                "league": entry.get("league", ""),
+                                "time": entry.get("time", ""),
+                                "market_key": m_key,
+                                "market_name": label,
+                                "initial_odd": round(i_val, 2),
+                                "current_odd": round(l_val, 2),
+                                "drop_pct": round(drop_ratio * 100, 1),
+                            })
+
+        drops.sort(key=lambda x: x["drop_pct"], reverse=True)
+        return drops
+
+    def fetch_mackolik_scores(self) -> Dict[str, Any]:
+        """
+        Mackolik canlı skor API'sinden anlık devam eden ve
+        bitmiş maçları ayrıştırarak skor ve durumlarıyla döndürür.
+        """
+        live_matches: List[Dict[str, Any]] = []
+        finished_matches: Dict[str, Dict[str, Any]] = {}
+
+        try:
+            raw = self._http_get_json(self.MACKOLIK_LIVE_URL, timeout=8)
+            m_list = raw.get("m", [])
+            for it in m_list:
+                if len(it) < 8:
+                    continue
+                m_id = it[0]
+                h_name = str(it[2]).strip()
+                a_name = str(it[4]).strip()
+                status = str(it[6]).strip()
+                score = str(it[7]).strip()
+                lg = ""
+                if len(it) > 35 and isinstance(it[35], list) and len(it[35]) > 3:
+                    lg = str(it[35][3]).strip()
+
+                h_goals, a_goals = None, None
+                for sep in ("-", ":"):
+                    if sep in score:
+                        parts = score.split(sep, 1)
+                        try:
+                            h_goals = int(parts[0].strip())
+                            a_goals = int(parts[1].strip())
+                        except ValueError:
+                            pass
+                        break
+
+                norm_key = f"{_normalize_team_name(h_name)}__{_normalize_team_name(a_name)}"
+                item_dict = {
+                    "id": m_id,
+                    "home": h_name,
+                    "away": a_name,
+                    "status": status,
+                    "score": score,
+                    "home_goals": h_goals,
+                    "away_goals": a_goals,
+                    "league": lg,
+                }
+
+                if status == "MS":
+                    finished_matches[norm_key] = item_dict
+                    finished_matches[_normalize_team_name(h_name)] = item_dict
+                    finished_matches[_normalize_team_name(a_name)] = item_dict
+                elif any(char.isdigit() for char in status) or status in ("İY", "Devre"):
+                    live_matches.append(item_dict)
+        except Exception:
+            pass
+
+        return {
+            "live": live_matches,
+            "finished": finished_matches,
+        }
 
 
 if __name__ == "__main__":

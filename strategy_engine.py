@@ -11,7 +11,10 @@ Kullanılan Matematiksel & Global Modeller:
 6. Positive Expected Value (+EV) & Fractional Kelly Criterion (Oran sapması / Değerli bahis tespiti)
 """
 
+import bisect
 import math
+import random
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
@@ -413,6 +416,8 @@ class MatchQuantitativeAnalyzer:
                 "iki_yari_kg": round(p_both_halves_btts * 100, 1),
             },
             "top_scores": [(s, round(p * 100, 1)) for s, p in top_3_scores],
+            "exact_scores": exact_scores,
+            "score_matrix": score_matrix,
             "form_notes": form_notes,
             "signals": signals,
         }
@@ -1311,3 +1316,420 @@ class MatchQuantitativeAnalyzer:
                 "target_win": target_win,
             })
         return plan
+
+    def scan_live_opportunities(self, live_matches: List[Dict[str, Any]], pre_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Canlı maçları (Mackolik) maç öncesi xG & tempo modellerimizle karşılaştırarak
+        oyun içi (In-Play) gol veya geri dönüş fırsatlarını yakalar.
+        """
+        if not live_matches or not pre_matches:
+            return []
+
+        # Maç öncesi analizleri indeksle
+        analyzed_map: Dict[str, Dict[str, Any]] = {}
+        for m in pre_matches:
+            h_norm = re.sub(r"[^a-z0-9]", "", m["home"].lower())
+            a_norm = re.sub(r"[^a-z0-9]", "", m["away"].lower())
+            analyzed_map[f"{h_norm}__{a_norm}"] = self.analyze_match(m)
+
+        opportunities: List[Dict[str, Any]] = []
+
+        for lm in live_matches:
+            h_live = re.sub(r"[^a-z0-9]", "", lm["home"].lower())
+            a_live = re.sub(r"[^a-z0-9]", "", lm["away"].lower())
+
+            # Eşleşen maç analizi bul
+            matched_a = (
+                analyzed_map.get(f"{h_live}__{a_live}")
+                or next((v for k, v in analyzed_map.items() if h_live in k or a_live in k), None)
+            )
+            if not matched_a:
+                continue
+
+            status = lm.get("status", "")
+            score = lm.get("score", "0-0")
+            h_g = lm.get("home_goals", 0) or 0
+            a_g = lm.get("away_goals", 0) or 0
+            tot_g = h_g + a_g
+
+            minute = 0
+            digits = re.findall(r"\d+", status)
+            if digits:
+                minute = int(digits[0])
+            elif status in ("İY", "Devre"):
+                minute = 45
+
+            lam_tot = matched_a["lam_total"]
+            p_home = matched_a["probabilities"]["ms_1"]
+            p_away = matched_a["probabilities"]["ms_2"]
+
+            # Fırsat 1: Geç Gol Radarı (Maç öncesi xG >= 2.60 ama dakika >= 45 ve gol sayısı az)
+            if lam_tot >= 2.60 and minute >= 40 and tot_g <= 1:
+                opportunities.append({
+                    "match": f"{lm['home']} - {lm['away']}",
+                    "league": lm.get("league", "") or matched_a["match"]["league"],
+                    "status": f"{status}. dk ({score})",
+                    "opportunity_type": "🔥 Canlı Geç Gol Radarı (0.5 Üst / 1.5 Üst)",
+                    "expected_goals": lam_tot,
+                    "confidence": round(min(92.0, 65.0 + lam_tot * 8.0), 1),
+                    "reason": f"Model maç öncesi yüksek tempo (λ={lam_tot:.2f}) öngörüyordu; şu an {minute}. dk ve skor {score}. İkinci yarıda kapanan savunmalar ve artan yorgunlukla gol patlaması bekleniyor.",
+                })
+
+            # Fırsat 2: Canlı Favori Baskısı (Favori maç öncesi %50+ galibiyete sahipti ama şu an geride/berabere)
+            elif p_home >= 54.0 and minute >= 45 and h_g <= a_g:
+                opportunities.append({
+                    "match": f"{lm['home']} - {lm['away']}",
+                    "league": lm.get("league", "") or matched_a["match"]["league"],
+                    "status": f"{status}. dk ({score})",
+                    "opportunity_type": f"⚡ Canlı Favori Baskısı ({lm['home']} Galibiyeti / Sıradaki Gol)",
+                    "expected_goals": lam_tot,
+                    "confidence": round(min(90.0, p_home + 15.0), 1),
+                    "reason": f"{lm['home']} maç öncesi %{p_home:.1f} kazanma olasılığına sahipti. {minute}. dakikada skor {score}; favorinin 2. yarıdaki hücum baskısı sıradaki golü getirebilir.",
+                })
+            elif p_away >= 54.0 and minute >= 45 and a_g <= h_g:
+                opportunities.append({
+                    "match": f"{lm['home']} - {lm['away']}",
+                    "league": lm.get("league", "") or matched_a["match"]["league"],
+                    "status": f"{status}. dk ({score})",
+                    "opportunity_type": f"⚡ Canlı Favori Deplasman Baskısı ({lm['away']} Galibiyeti / Sıradaki Gol)",
+                    "expected_goals": lam_tot,
+                    "confidence": round(min(90.0, p_away + 15.0), 1),
+                    "reason": f"{lm['away']} maç öncesi %{p_away:.1f} kazanma olasılığına sahipti. {minute}. dakikada skor {score}; favori deplasman galibiyeti değerli.",
+                })
+
+        opportunities.sort(key=lambda x: x["confidence"], reverse=True)
+        return opportunities
+
+    def build_custom_wizard_coupon(
+        self,
+        matches: List[Dict[str, Any]],
+        match_count: int = 3,
+        min_total_odd: float = 2.0,
+        max_total_odd: float = 8.0,
+        risk_level: str = "ideal",
+    ) -> Dict[str, Any]:
+        """
+        Kullanıcının parametrelerine göre (maç sayısı, hedef oran, risk seviyesi)
+        kişiselleştirilmiş akıllı kupon üretir.
+        """
+        all_analyzed = [self.analyze_match(m) for m in matches]
+        all_analyzed = [a for a in all_analyzed if a["signals"]]
+
+        risk_level_clean = risk_level.lower()
+        if "garanti" in risk_level_clean:
+            allowed = ["ms_banko", "ust_25", "alt_taktigi", "kg_var", "takim_iki_yari_gol"]
+            single_min, single_max = 1.25, 1.65
+            title = "🟢 SİHİRBAZ: GARANTİ KASA KATLAYICI"
+        elif "value" in risk_level_clean or "deger" in risk_level_clean:
+            allowed = ["value_bet", "kombo", "iy_ust", "ust_35"]
+            single_min, single_max = 1.60, 2.50
+            title = "🟡 SİHİRBAZ: DEĞERLİ ORAN (+EV) KOMBİNİ"
+        elif "bomba" in risk_level_clean or "surpriz" in risk_level_clean:
+            allowed = ["arti_6_gol", "iyms_surpriz", "kesin_skor", "ust_35", "iki_yari_kg"]
+            single_min, single_max = 2.00, 15.00
+            title = "🔴 SİHİRBAZ: YÜKSEK ÇARPAN SÜRPRİZ BOMBA"
+        else:
+            allowed = ["kg_var", "ust_25", "tg_aralik", "korner", "takim_iki_yari_gol", "kombo"]
+            single_min, single_max = 1.45, 1.95
+            title = "🔵 SİHİRBAZ: DENGELİ İDEAL KOMBİNE"
+
+        cands = []
+        for a in all_analyzed:
+            for k in allowed:
+                s = a["signals"].get(k)
+                if s and single_min <= s["odd"] <= single_max:
+                    cands.append((a, s))
+                    break
+
+        cands.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
+        chosen = cands[:match_count]
+
+        total_odd = 1.0
+        picks = []
+        for a, s in chosen:
+            total_odd *= s["odd"]
+            picks.append({
+                "match": f"{a['match']['home']} - {a['match']['away']}",
+                "league": a["match"]["league"],
+                "time": f"{a['match']['date']} {a['match']['time']}",
+                "pick": s["pick"],
+                "odd": s["odd"],
+                "prob": s["prob"],
+                "reason": s["reasons"][0] if s["reasons"] else "",
+            })
+
+        return {
+            "title": title,
+            "target_odd_range": f"{min_total_odd:.2f} - {max_total_odd:.2f}",
+            "requested_matches": match_count,
+            "total_odd": round(total_odd, 2),
+            "picks": picks,
+        }
+
+    @staticmethod
+    def evaluate_pick(pick: str, home_score: int, away_score: int) -> bool:
+        """Verilen maç sonucuna göre tercihin kazanıp kazanmadığını matematiksel olarak doğrular."""
+        p = pick.lower()
+        tot = home_score + away_score
+        if "ms 1" in p:
+            return home_score > away_score
+        elif "ms 2" in p:
+            return away_score > home_score
+        elif "ms x" in p:
+            return home_score == away_score
+        elif "2.5 gol üst" in p or "2.5 üst" in p:
+            return tot >= 3
+        elif "2.5 gol alt" in p or "2.5 alt" in p:
+            return tot < 3
+        elif "3.5 gol üst" in p or "3.5 üst" in p:
+            return tot >= 4
+        elif "kg var" in p:
+            return home_score >= 1 and away_score >= 1
+        elif "kg yok" in p:
+            return home_score == 0 or away_score == 0
+        elif "6+" in p or "+6" in p:
+            return tot >= 6
+        elif "2-3 gol" in p:
+            return 2 <= tot <= 3
+        elif "4-5 gol" in p:
+            return 4 <= tot <= 5
+        elif "ev sahibi" in p and "1.5 gol üst" in p:
+            return home_score >= 2
+        elif "deplasman" in p and "1.5 gol üst" in p:
+            return away_score >= 2
+        elif "skor:" in p:
+            m = re.search(r"(\d+)[\-_:](\d+)", p)
+            if m:
+                return home_score == int(m.group(1)) and away_score == int(m.group(2))
+        return False
+
+    def scan_trap_matches(self, matches: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+        """
+        Piyasa ve halkın yoğun şekilde favoriye yüklendiği ancak modelin yüksek patlama/tuzak riski
+        öngördüğü maçları (Reverse Line Movement / Value Trap) tespit eder.
+        """
+        traps: List[Dict[str, Any]] = []
+
+        for m in matches:
+            odds = m.get("odds", {})
+            o_1 = odds.get("ms_1")
+            o_2 = odds.get("ms_2")
+
+            fav_is_home = None
+            fav_odd = None
+            if o_1 and 1.20 <= o_1 <= 1.68:
+                fav_is_home = True
+                fav_odd = o_1
+            elif o_2 and 1.20 <= o_2 <= 1.68:
+                fav_is_home = False
+                fav_odd = o_2
+
+            if fav_is_home is None or fav_odd is None:
+                continue
+
+            a = self.analyze_match(m)
+            p = a["probabilities"]
+            lam_h = a["lam_home"]
+            lam_a = a["lam_away"]
+            chaos = a["chaos_index"]
+
+            fav_name = m["home"] if fav_is_home else m["away"]
+            dog_name = m["away"] if fav_is_home else m["home"]
+            fav_prob = p["ms_1"] if fav_is_home else p["ms_2"]
+            fav_lam = lam_h if fav_is_home else lam_a
+            dog_lam = lam_a if fav_is_home else lam_h
+
+            implied_market_prob = (1.0 / fav_odd) * 100
+            prob_diff = implied_market_prob - fav_prob
+            trap_score = 0
+            reasons: List[str] = []
+
+            if prob_diff >= 6.0:
+                trap_score += int(min(35, prob_diff * 2.2))
+                reasons.append(
+                    f"Piyasa favoriye %{implied_market_prob:.1f} verirken, modelin gerçek kazanma ihtimali %{fav_prob:.1f} (Piyasa Şişirmesi: %{prob_diff:.1f} fark)"
+                )
+
+            if dog_lam >= 1.05:
+                trap_score += 25
+                reasons.append(
+                    f"{dog_name} takımının gizli gol tehdidi yüksek (λ={dog_lam:.2f} gol). Favori savunması açık vermeye meyilli."
+                )
+
+            if chaos >= 50:
+                trap_score += 20
+                reasons.append(
+                    f"Maçın kaos ve değişkenlik endeksi yüksek ({chaos}/100); favorinin kaza yapma ihtimali kuvvetli."
+                )
+
+            if fav_lam <= 1.55:
+                trap_score += 15
+                reasons.append(
+                    f"Favori {fav_name} takımının gol beklentisi kısıtlı (λ={fav_lam:.2f}); tek farklı skor veya puan kaybı riski var."
+                )
+
+            if trap_score >= 50:
+                danger_level = "🚨 KRİTİK PATLAMA RİSKİ" if trap_score >= 70 else "⚠️ DİKKAT: TUZAK RİSKİ"
+
+                if dog_lam >= 1.15:
+                    anti_pick = f"Rakip ({dog_name}) 0.5 Gol Üst veya KG Var"
+                elif fav_is_home:
+                    anti_pick = f"Deplasman ({dog_name}) +1.5 Handikap veya X2 Çifte Şans"
+                else:
+                    anti_pick = f"Ev Sahibi ({dog_name}) +1.5 Handikap veya 1X Çifte Şans"
+
+                traps.append({
+                    "match": m,
+                    "favorite": fav_name,
+                    "favorite_odd": fav_odd,
+                    "underdog": dog_name,
+                    "trap_score": min(98, trap_score),
+                    "danger_level": danger_level,
+                    "implied_market_prob": round(implied_market_prob, 1),
+                    "model_prob": round(fav_prob, 1),
+                    "reasons": reasons,
+                    "anti_pick": anti_pick,
+                })
+
+        traps.sort(key=lambda x: x["trap_score"], reverse=True)
+        return traps[:top_n]
+
+    def scan_tension_matches(self, matches: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+        """
+        Derbi, sert lig mücadeleleri ve yüksek tansiyonlu maçları tarar;
+        Kart ve korner baskısı yüksek mücadeleleri sinyaller.
+        """
+        high_tension_leagues = [
+            "türkiye", "super lig", "süper lig", "la liga", "segunda",
+            "serie a", "argentina", "copa libertadores", "greece",
+            "championship", "scotland", "poland", "serbia", "derby"
+        ]
+
+        tensions: List[Dict[str, Any]] = []
+
+        for m in matches:
+            a = self.analyze_match(m)
+            odds = m.get("odds", {})
+            league_lower = m.get("league", "").lower()
+            chaos = a["chaos_index"]
+
+            is_tension_league = any(tl in league_lower for tl in high_tension_leagues)
+            base_score = 45 if is_tension_league else 25
+
+            o_1 = odds.get("ms_1", 2.50)
+            o_2 = odds.get("ms_2", 2.50)
+            diff = abs(o_1 - o_2)
+            if diff < 1.2:
+                base_score += 25
+            elif diff < 2.0:
+                base_score += 15
+
+            base_score += int(chaos * 0.3)
+
+            exp_cards = round(3.8 + (base_score / 100.0) * 2.8, 1)
+            exp_corners = round(8.8 + (a["lam_total"] * 0.9), 1)
+
+            card_prob = min(88.0, 50.0 + (base_score * 0.4))
+            red_card_risk = min(40.0, 10.0 + (base_score * 0.3))
+
+            if base_score >= 60:
+                tensions.append({
+                    "match": m,
+                    "league": m.get("league", ""),
+                    "tension_score": min(98, base_score),
+                    "expected_cards": exp_cards,
+                    "expected_corners": exp_corners,
+                    "card_pick": "4.5 Üst Sarı Kart" if exp_cards >= 5.0 else "3.5 Üst Sarı Kart",
+                    "corner_pick": "9.5 Üst Korner" if exp_corners >= 10.0 else "8.5 Üst Korner",
+                    "card_prob": round(card_prob, 1),
+                    "red_card_risk": round(red_card_risk, 1),
+                    "reason": f"Sert mücadele endeksi (%{base_score}), başa baş maç dengesi ve lig karakteri yüksek kart baskısına işaret ediyor."
+                })
+
+        tensions.sort(key=lambda x: x["tension_score"], reverse=True)
+        return tensions[:top_n]
+
+    def run_monte_carlo_simulation(self, match: Dict[str, Any], n_sims: int = 10000) -> Dict[str, Any]:
+        """
+        Dixon-Coles ve Poisson parametrelerini kullanarak bir maçı 10.000 kez bilgisayarda simüle eder.
+        Kesin kazanma frekanslarını, gol limitlerini ve en sık çıkan kesin skorları hesaplar.
+        """
+        a = self.analyze_match(match)
+        score_matrix = a["score_matrix"]
+
+        scores: List[Tuple[int, int]] = []
+        cum_probs: List[float] = []
+        total_p = sum(sum(row) for row in score_matrix)
+        acc = 0.0
+
+        for h in range(9):
+            for aw in range(9):
+                p = score_matrix[h][aw] / total_p if total_p > 0 else 1.0 / 81.0
+                acc += p
+                cum_probs.append(acc)
+                scores.append((h, aw))
+        cum_probs[-1] = 1.0
+
+        home_wins = 0
+        draws = 0
+        away_wins = 0
+        over_15 = 0
+        over_25 = 0
+        over_35 = 0
+        btts = 0
+        tot_goals = 0
+        score_counts: Dict[Tuple[int, int], int] = {}
+
+        for _ in range(n_sims):
+            r = random.random()
+            idx = bisect.bisect_left(cum_probs, r)
+            if idx >= len(scores):
+                idx = len(scores) - 1
+            hg, ag = scores[idx]
+
+            if hg > ag:
+                home_wins += 1
+            elif hg == ag:
+                draws += 1
+            else:
+                away_wins += 1
+
+            tg = hg + ag
+            tot_goals += tg
+            if tg >= 2:
+                over_15 += 1
+            if tg >= 3:
+                over_25 += 1
+            if tg >= 4:
+                over_35 += 1
+            if hg > 0 and ag > 0:
+                btts += 1
+
+            score_counts[(hg, ag)] = score_counts.get((hg, ag), 0) + 1
+
+        top_scores = sorted(score_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_scores_formatted = [
+            {"score": f"{sc[0]}-{sc[1]}", "count": cnt, "pct": round(cnt / n_sims * 100, 1)}
+            for sc, cnt in top_scores
+        ]
+
+        return {
+            "match": f"{match['home']} vs {match['away']}",
+            "home": match["home"],
+            "away": match["away"],
+            "league": match.get("league", ""),
+            "date": match.get("date", ""),
+            "time": match.get("time", ""),
+            "n_sims": n_sims,
+            "home_win_pct": round(home_wins / n_sims * 100, 1),
+            "draw_pct": round(draws / n_sims * 100, 1),
+            "away_win_pct": round(away_wins / n_sims * 100, 1),
+            "over_15_pct": round(over_15 / n_sims * 100, 1),
+            "over_25_pct": round(over_25 / n_sims * 100, 1),
+            "over_35_pct": round(over_35 / n_sims * 100, 1),
+            "btts_pct": round(btts / n_sims * 100, 1),
+            "avg_goals": round(tot_goals / n_sims, 2),
+            "top_scores": top_scores_formatted,
+            "lambda_home": a["lam_home"],
+            "lambda_away": a["lam_away"],
+        }
