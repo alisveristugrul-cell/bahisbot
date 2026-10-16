@@ -24,15 +24,23 @@ Komutlar:
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 
 from data_fetcher import GlobalMatchDataFetcher
 from strategy_engine import MatchQuantitativeAnalyzer
+
+
+def _safe_html(text: Any) -> str:
+    """Telegram HTML modunda parse hatası vermemesi için özel karakterleri güvenle kaçırır."""
+    if text is None:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -62,6 +70,8 @@ class BettingBotFormatter:
         self.analyzer = analyzer
         self._matches_cache: List[Dict[str, Any]] = []
         self._last_load_ts: float = 0.0
+        self._coupons_cache: Optional[Dict[str, Any]] = None
+        self._last_coupons_ts: float = 0.0
 
     def get_matches(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         now = time.time()
@@ -73,7 +83,16 @@ class BettingBotFormatter:
             self._last_load_ts = now
         return self._matches_cache
 
-    def format_strategy_picks(self, strategy_key: str, top_n: int = 6) -> str:
+    def get_smart_coupons(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Kupon hesaplama sonucunu 5 dakika önbelleğe alarak anında yanıt verir."""
+        now = time.time()
+        if force_refresh or not self._coupons_cache or (now - self._last_coupons_ts > 300):
+            matches = self.get_matches(force_refresh=force_refresh)
+            self._coupons_cache = self.analyzer.build_smart_coupons(matches)
+            self._last_coupons_ts = now
+        return self._coupons_cache
+
+    def format_strategy_picks(self, strategy_key: str, top_n: int = 5) -> str:
         meta = self.analyzer.STRATEGY_METADATA.get(strategy_key)
         if not meta:
             return "❌ Geçersiz strateji kodu."
@@ -82,8 +101,8 @@ class BettingBotFormatter:
         picks = self.analyzer.scan_bulletin(matches, strategy_key, top_n=top_n, fetcher=self.fetcher)
 
         lines = [
-            f"<b>{meta['title']}</b>",
-            f"<i>{meta['desc']}</i>",
+            f"<b>{_safe_html(meta['title'])}</b>",
+            f"<i>{_safe_html(meta['desc'])}</i>",
             f"📊 Taranan Global Maç: <b>{len(matches)}</b> | Bulunan En İyi Seçim: <b>{len(picks)}</b>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
@@ -100,88 +119,115 @@ class BettingBotFormatter:
             top_sc = ", ".join(f"{sc} (%{pr})" for sc, pr in a["top_scores"][:2])
 
             lines.append(
-                f"<b>{idx}. ⚽ {m['home']} - {m['away']}</b>\n"
-                f"   🏆 {m['league']} | 🕒 {m['date']} {m['time']}\n"
-                f"   🎯 <b>Tahmin:</b> {s['pick']}  |  💰 <b>Oran: {s['odd']:.2f}</b>\n"
+                f"<b>{idx}. ⚽ {_safe_html(m['home'])} - {_safe_html(m['away'])}</b>\n"
+                f"   🏆 {_safe_html(m['league'])} | 🕒 {m['date']} {m['time']}\n"
+                f"   🎯 <b>Tahmin:</b> {_safe_html(s['pick'])}  |  💰 <b>Oran: {s['odd']:.2f}</b>\n"
                 f"   📈 <b>Model Olasılığı:</b> %{s['prob']:.1f} | 🔥 <b>Güven:</b> %{s['confidence']:.1f} ({ev_str})\n"
                 f"   🧮 <b>Beklenen Gol (xG):</b> Ev {a['lam_home']} - Dep {a['lam_away']} (Top: {a['lam_total']}) | 🎲 Skor: {top_sc}\n"
-                f"   💡 <b>Neden?:</b> {'; '.join(s['reasons'])}"
+                f"   💡 <b>Neden?:</b> {'; '.join(_safe_html(r) for r in s['reasons'])}"
             )
             lines.append("──────────────────────")
 
         return "\n".join(lines)
 
-    def format_coupons(self) -> str:
-        matches = self.get_matches()
-        coupons = self.analyzer.build_smart_coupons(matches)
-        lines = [
-            "🎫 <b>GÜNÜN 5 KADEMELİ KOMBİNE KUPONLARI (GARANTİDEN SÜRPRİZE)</b>",
-            f"<i>Dixon-Coles 9x9 matrisi ve Çapraz Market (+EV) modelleriyle {len(matches)} maç taranarak hazırlandı:</i>",
+    def format_coupons(self) -> List[str]:
+        coupons = self.get_smart_coupons()
+        matches_count = len(self.get_matches())
+
+        def _format_single_coupon(c: Dict[str, Any]) -> List[str]:
+            c_lines = []
+            title = _safe_html(c.get("title", ""))
+            desc = _safe_html(c.get("desc", ""))
+            c_lines.append(f"<b>{title}</b>")
+            c_lines.append(f"<i>{desc}</i>")
+            picks = c.get("picks", [])
+            if not picks:
+                c_lines.append("   ⚠️ Uygun maç bulunamadı.\n")
+                return c_lines
+            for idx, p in enumerate(picks, 1):
+                c_lines.append(
+                    f"  {idx}) <b>{_safe_html(p['match'])}</b> ({p['time']})\n"
+                    f"     👉 <b>{_safe_html(p['pick'])}</b> | Oran: <b>{p['odd']:.2f}</b> (Model: %{p['prob']:.1f})\n"
+                    f"     📌 <i>{_safe_html(p['reason'])}</i>"
+                )
+            c_lines.append(f"🔥 <b>Toplam Kupon Oranı: {c.get('total_odd', 0.0):.2f}</b>")
+            c_lines.append("──────────────────────")
+            return c_lines
+
+        # BÖLÜM 1: 1. Garanti ve 2. İdeal Kuponlar (Telegram 4096 karakter sınırına takılmaz)
+        p1_lines = [
+            "🎫 <b>GÜNÜN 5 KADEMELİ KOMBİNE KUPONLARI (BÖLÜM 1/2)</b>",
+            f"<i>Dixon-Coles 9x9 matrisi ve Çapraz Market (+EV) modelleriyle {matches_count} maç taranarak hazırlandı:</i>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
+        for k in ["kupon_1_garanti", "kupon_2_ideal"]:
+            if k in coupons:
+                p1_lines.extend(_format_single_coupon(coupons[k]))
 
-        tiered_keys = [
-            "kupon_1_garanti",
-            "kupon_2_ideal",
-            "kupon_3_value",
-            "kupon_4_agresif",
-            "kupon_5_bomba",
+        # BÖLÜM 2: 3. Value, 4. Agresif ve 5. Bomba Kuponlar
+        p2_lines = [
+            "🎫 <b>GÜNÜN 5 KADEMELİ KOMBİNE KUPONLARI (BÖLÜM 2/2)</b>",
+            "<i>(Değerli Oranlar, Yüksek Çarpanlar ve Sürpriz Vurgun Kuponları)</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
         ]
-
-        for key in tiered_keys:
-            c = coupons.get(key)
-            if not c:
-                continue
-            lines.append(f"<b>{c['title']}</b>")
-            lines.append(f"<i>{c['desc']}</i>")
-            if not c["picks"]:
-                lines.append("   ⚠️ Uygun maç bulunamadı.\n")
-                continue
-            for idx, p in enumerate(c["picks"], 1):
-                lines.append(
-                    f"  {idx}) <b>{p['match']}</b> ({p['time']})\n"
-                    f"     👉 <b>{p['pick']}</b> | Oran: <b>{p['odd']:.2f}</b> (Model: %{p['prob']:.1f})\n"
-                    f"     📌 <i>{p['reason']}</i>"
-                )
-            lines.append(f"🔥 <b>Toplam Kupon Oranı: {c['total_odd']:.2f}</b>")
-            lines.append("──────────────────────")
-
-        lines.append(
-            "💡 <i>Absürt oranlı sistem denemeleri için <b>/sistem</b> komutunu veya aşağıdaki sistem butonunu kullanabilirsiniz.</i>"
+        for k in ["kupon_3_value", "kupon_4_agresif", "kupon_5_bomba"]:
+            if k in coupons:
+                p2_lines.extend(_format_single_coupon(coupons[k]))
+        p2_lines.append(
+            "💡 <i>Absürt oranlı sistem denemeleri için <b>/sistem</b> butonunu kullanabilirsiniz.</i>"
         )
-        return "\n".join(lines)
 
-    def format_system_coupons(self) -> str:
-        matches = self.get_matches()
-        coupons = self.analyzer.build_smart_coupons(matches)
-        lines = [
-            "🎰 <b>GÜNÜN ABSÜRT ORANLI 2 SİSTEM KUPONU PAKETİ</b>",
-            "<i>(İY/MS 1/2-2/1 Geri Dönüşler, +6 Gol, İki Yarı KG ve Yüksek Skor Denemeleri)</i>",
+        return ["\n".join(p1_lines), "\n".join(p2_lines)]
+
+    def format_system_coupons(self) -> List[str]:
+        coupons = self.get_smart_coupons()
+
+        def _format_single_system(sc: Dict[str, Any]) -> List[str]:
+            s_lines = []
+            title = _safe_html(sc.get("title", ""))
+            desc = _safe_html(sc.get("desc", ""))
+            formula = _safe_html(sc.get("system_formula", ""))
+            payout = _safe_html(sc.get("sample_payout", ""))
+            s_lines.append(f"<b>{title}</b>")
+            s_lines.append(f"<i>{desc}</i>")
+            if formula:
+                s_lines.append(f"📋 <b>{formula}</b>")
+            if payout:
+                s_lines.append(f"💰 <b>{payout}</b>\n")
+            for idx, p in enumerate(sc.get("picks", []), 1):
+                s_lines.append(
+                    f"  {idx}) <b>{_safe_html(p['match'])}</b> ({p['time']})\n"
+                    f"     👉 <b>{_safe_html(p['pick'])}</b> | Oran: <b>{p['odd']:.2f}</b>\n"
+                    f"     📌 <i>{_safe_html(p['reason'])}</i>"
+                )
+            s_lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+            return s_lines
+
+        # BÖLÜM 1: Sistem 8 (Kaos & Geri Dönüşler)
+        p1_lines = [
+            "🎰 <b>GÜNÜN 2 SİSTEM KUPONU PAKETİ (BÖLÜM 1/2)</b>",
+            "<i>(İY/MS 1/2-2/1 Geri Dönüşler, +6 Gol ve İki Yarı KG Karması)</i>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
+        if "sistem_8_kaos" in coupons:
+            p1_lines.extend(_format_single_system(coupons["sistem_8_kaos"]))
 
-        for s_key in ["sistem_8_kaos", "sistem_10_skor"]:
-            sc = coupons.get(s_key)
-            if not sc:
-                continue
-            lines.append(f"<b>{sc['title']}</b>")
-            lines.append(f"<i>{sc['desc']}</i>")
-            lines.append(f"📋 <b>{sc['system_formula']}</b>")
-            lines.append(f"💰 <b>{sc['sample_payout']}</b>\n")
-            for idx, p in enumerate(sc["picks"], 1):
-                lines.append(
-                    f"  {idx}) <b>{p['match']}</b> ({p['time']})\n"
-                    f"     👉 <b>{p['pick']}</b> | Oran: <b>{p['odd']:.2f}</b>\n"
-                    f"     📌 <i>{p['reason']}</i>"
-                )
-            lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        # BÖLÜM 2: Sistem 10 (Kesin Skor & Ultra Bomba) + Taktikler
+        p2_lines = [
+            "🌌 <b>GÜNÜN 2 SİSTEM KUPONU PAKETİ (BÖLÜM 2/2)</b>",
+            "<i>(Dixon-Coles Kesin Skorlar & Ultra Yüksek Oran Denemeleri)</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if "sistem_10_skor" in coupons:
+            p2_lines.extend(_format_single_system(coupons["sistem_10_skor"]))
 
-        lines.append(
+        p2_lines.append(
             "⚠️ <b>Sistem Oynama Taktikleri:</b>\n"
             "• Bu kuponlar 'hepsi gelsin' diye oynanmaz; 8 maçtan 4 tanesi veya 10 maçtan 4-5 tanesi geldiğinde bile kasayı katlamak için sistem olarak işaretlenir!\n"
             "• Kasanızın en fazla %5-%10'unu bu absürt sistemlere ayırmanız önerilir."
         )
-        return "\n".join(lines)
+
+        return ["\n".join(p1_lines), "\n".join(p2_lines)]
 
     def format_bankroll_plan(self, amount: float = 1000.0) -> str:
         plan = self.analyzer.get_bankroll_plan(total_bankroll=amount)
@@ -205,6 +251,58 @@ class BettingBotFormatter:
             f"3., 4., 5. ve Sistem kuponları ise küçük miktarlarla büyük patlama (asimetrik getiri) hedefler."
         )
         return "\n".join(lines)
+
+    def format_upcoming_coupons(self, hours: int = 4) -> List[str]:
+        matches = self.get_matches()
+        data = self.analyzer.build_upcoming_window_coupons(matches, hours=hours)
+        w_hours = data["window_hours"]
+        start_t = data["start_time"]
+        end_t = data["end_time"]
+        cnt = data["match_count"]
+
+        def _format_coupon_item(c: Dict[str, Any]) -> List[str]:
+            lines = [f"<b>{_safe_html(c['title'])}</b>", f"<i>{_safe_html(c['desc'])}</i>"]
+            picks = c.get("picks", [])
+            if not picks:
+                lines.append("   ⚠️ Bu zaman aralığında bu risk profiline uygun maç bulunamadı.\n")
+                return lines
+            for idx, p in enumerate(picks, 1):
+                m_txt = _safe_html(p["match"])
+                p_txt = _safe_html(p["pick"])
+                r_txt = _safe_html(p["reason"])
+                lines.append(
+                    f"  {idx}) <b>{m_txt}</b> ({p['time']})\n"
+                    f"     👉 <b>{p_txt}</b> | Oran: <b>{p['odd']:.2f}</b> (Model: %{p['prob']:.1f})\n"
+                    f"     📌 <i>{r_txt}</i>"
+                )
+            lines.append(f"🔥 <b>Toplam Kupon Oranı: {c['total_odd']:.2f}</b>")
+            lines.append("──────────────────────")
+            return lines
+
+        # BÖLÜM 1: 1. Garanti ve 2. İdeal Kuponlar
+        p1_lines = [
+            f"⏱️ <b>ÖNÜMÜZDEKİ {w_hours} SAATİN KUPONLARI (BÖLÜM 1/2)</b>",
+            f"<i>🕒 Zaman Penceresi: <b>{start_t} - {end_t}</b> | Taranan Yaklaşan Maç: <b>{cnt}</b></i>",
+            "<i>Garantiden riskliye doğru anlık oynanabilir en iyi seçimler:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for c in data["coupons"][:2]:
+            p1_lines.extend(_format_coupon_item(c))
+
+        # BÖLÜM 2: 3. Değer & Fırsat ve 4. Sürpriz Vurgun Kuponları
+        p2_lines = [
+            f"⏱️ <b>ÖNÜMÜZDEKİ {w_hours} SAATİN KUPONLARI (BÖLÜM 2/2)</b>",
+            "<i>(Orta Riskli Değer &amp; Yüksek Oranlı Sürpriz Vurgun Kuponları)</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for c in data["coupons"][2:]:
+            p2_lines.extend(_format_coupon_item(c))
+
+        p2_lines.append(
+            "💡 <i>Günün tüm bültenini kapsayan 5 kademeli kuponlar için <b>/kupon</b> butonunu kullanabilirsiniz.</i>"
+        )
+
+        return ["\n".join(p1_lines), "\n".join(p2_lines)]
 
     def format_match_xray(self, query: str) -> str:
         query_clean = query.strip().lower()
@@ -327,6 +425,9 @@ class TelegramBettingBot:
             {"text": "💰 Akıllı Kasa Dağıtımı", "callback_data": "action:kasa"},
         ],
         [
+            {"text": "⏱️ Önümüzdeki 4 Saat Kuponları", "callback_data": "action:upcoming_4h"},
+        ],
+        [
             {"text": "🎫 5 Kademeli Kuponlar (Garanti ➔ Bomba)", "callback_data": "action:coupons"},
         ],
         [
@@ -374,22 +475,62 @@ class TelegramBettingBot:
         with urllib.request.urlopen(req, timeout=35) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def send_message(self, chat_id: int, text: str, show_menu: bool = True) -> None:
-        # Telegram mesaj sınırı 4096 karakterdir; uzunsa bölerek gönder
-        chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)]
-        for idx, chunk in enumerate(chunks):
-            payload: Dict[str, Any] = {
-                "chat_id": chat_id,
-                "text": chunk,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            if show_menu and idx == len(chunks) - 1:
-                payload["reply_markup"] = {"inline_keyboard": self.STRATEGY_BUTTONS}
-            try:
-                self._api_call("sendMessage", payload)
-            except Exception as e:
-                print(f"[Telegram Send Error] {e}")
+    @staticmethod
+    def _smart_split_text(text: str, max_len: int = 3600) -> List[str]:
+        """Metni HTML etiketlerini veya maç bloklarını kırmadan satır sonlarından böler."""
+        if len(text) <= max_len:
+            return [text]
+        chunks: List[str] = []
+        cur_lines: List[str] = []
+        cur_len = 0
+        for line in text.split("\n"):
+            line_len = len(line) + 1
+            if cur_len + line_len > max_len and cur_lines:
+                chunks.append("\n".join(cur_lines))
+                cur_lines = [line]
+                cur_len = line_len
+            else:
+                cur_lines.append(line)
+                cur_len += line_len
+        if cur_lines:
+            chunks.append("\n".join(cur_lines))
+        return chunks
+
+    def send_message(self, chat_id: int, content: Any, show_menu: bool = True) -> None:
+        """
+        Mesajı veya mesaj listesini güvenle Telegram'a gönderir.
+        HTML ayrıştırma hatası olursa anında düz metin (plain text) yedeğiyle yeniden dener.
+        """
+        if isinstance(content, list):
+            items = content
+        else:
+            items = [str(content)]
+
+        for idx, raw_text in enumerate(items):
+            is_last = (idx == len(items) - 1)
+            chunks = self._smart_split_text(raw_text, max_len=3600)
+
+            for c_idx, chunk in enumerate(chunks):
+                attach_menu = show_menu and is_last and (c_idx == len(chunks) - 1)
+                payload: Dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }
+                if attach_menu:
+                    payload["reply_markup"] = {"inline_keyboard": self.STRATEGY_BUTTONS}
+
+                try:
+                    self._api_call("sendMessage", payload)
+                except Exception as e:
+                    print(f"[Telegram Send Warning] {e} -> Düz metin olarak yeniden deneniyor...")
+                    payload["parse_mode"] = None
+                    payload["text"] = re.sub(r"<[^>]+>", "", chunk)
+                    try:
+                        self._api_call("sendMessage", payload)
+                    except Exception as e2:
+                        print(f"[Telegram Plaintext Send Error] {e2}")
 
     def handle_command(self, chat_id: int, text: str) -> None:
         parts = text.strip().split(maxsplit=1)
@@ -422,6 +563,7 @@ class TelegramBettingBot:
                 "<b>Inverse Multi-Market Poisson (xG)</b>, <b>Half-Split Tempo</b> ve "
                 "<b>Sharp Value (+EV)</b> modelleriyle tarar.\n\n"
                 "👇 <b>Aşağıdaki butonlardan istediğiniz taktiği seçebilir veya komutları kullanabilirsiniz:</b>\n"
+                "• <code>/4saat</code> — ⏱️ Önümüzdeki 4 Saatin Maçları (Garantiden Riskliye)\n"
                 "• <code>/kupon</code> — 🎫 5 Kademeli Günlük Kupon (Garanti ➔ Bomba)\n"
                 "• <code>/sistem</code> — 🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)\n"
                 "• <code>/kasa &lt;tutar&gt;</code> — 💰 Akıllı Kasa Dağıtım Planı (Örn: <code>/kasa 1000</code>)\n"
@@ -444,6 +586,9 @@ class TelegramBettingBot:
         elif cmd in cmd_map:
             reply = self.formatter.format_strategy_picks(cmd_map[cmd])
             self.send_message(chat_id, reply, show_menu=True)
+
+        elif cmd in ("/4saat", "/yaklasan"):
+            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=4), show_menu=True)
 
         elif cmd == "/kupon":
             self.send_message(chat_id, self.formatter.format_coupons(), show_menu=True)
@@ -518,6 +663,7 @@ class TelegramBettingBot:
     def _register_bot_commands(self) -> None:
         commands = [
             {"command": "menu", "description": "📋 İnteraktif Taktik & Analiz Menüsü"},
+            {"command": "4saat", "description": "⏱️ Önümüzdeki 4 Saatin Kuponları (Garantiden Riskliye)"},
             {"command": "kupon", "description": "🎫 5 Kademeli Günlük Kuponlar (Garanti ➔ Bomba)"},
             {"command": "sistem", "description": "🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)"},
             {"command": "kasa", "description": "💰 Akıllı Kasa Dağıtım Planı (Örn: /kasa 1000)"},
@@ -604,7 +750,15 @@ class TelegramBettingBot:
                         chat_id = cq["message"]["chat"]["id"]
                         data = cq.get("data", "")
                         try:
-                            self._api_call("answerCallbackQuery", {"callback_query_id": cq_id})
+                            self._api_call("answerCallbackQuery", {
+                                "callback_query_id": cq_id,
+                                "text": "Tahminler hazırlanıyor... ⏳",
+                            })
+                        except Exception:
+                            pass
+
+                        try:
+                            self._api_call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
                         except Exception:
                             pass
 
@@ -612,6 +766,8 @@ class TelegramBettingBot:
                             s_key = data.split(":", 1)[1]
                             reply = self.formatter.format_strategy_picks(s_key)
                             self.send_message(chat_id, reply, show_menu=True)
+                        elif data == "action:upcoming_4h":
+                            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=4), show_menu=True)
                         elif data == "action:coupons":
                             self.send_message(chat_id, self.formatter.format_coupons(), show_menu=True)
                         elif data == "action:system":
@@ -635,9 +791,12 @@ class TelegramBettingBot:
                 time.sleep(5)
 
 
-def strip_html(text: str) -> str:
+def strip_html(content: Union[str, List[str]]) -> str:
     """Terminal çıktısı için HTML etiketlerini temizler."""
-    import re
+    if isinstance(content, list):
+        text = "\n\n".join(content)
+    else:
+        text = str(content)
     return re.sub(r"<[^>]+>", "", text)
 
 

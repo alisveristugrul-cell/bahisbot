@@ -12,7 +12,7 @@ Kullanılan Matematiksel & Global Modeller:
 """
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 def poisson_pmf(k: int, lam: float) -> float:
@@ -1147,6 +1147,145 @@ class MatchQuantitativeAnalyzer:
                 "sample_payout": f"4 Maç Tutarsa Ortalama Çarpan: ~{sample_win_s10_4:.1f}x | 5 Maç Tutarsa Rekor Çarpan",
                 "picks": _pack_coupon("", "", sistem_10_picks)["picks"],
             },
+        }
+
+    def build_upcoming_window_coupons(self, matches: List[Dict[str, Any]], hours: int = 4) -> Dict[str, Any]:
+        """
+        Önümüzdeki 4 saat içinde başlayacak maçları filtreleyerek
+        Garantiden Riskliye Doğru 4 Kademeli Yaklaşan Maç Kuponu üretir.
+        """
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        limit = now + timedelta(hours=hours)
+
+        # 4 saatlik penceredeki maçları al
+        window_matches = [m for m in matches if now <= m.get("start_dt", now) <= limit]
+        actual_hours = hours
+        if len(window_matches) < 6:
+            # Gece veya sakin saatlerde maç az ise pencereyi otomatik genişlet
+            actual_hours = 8
+            limit = now + timedelta(hours=actual_hours)
+            window_matches = [m for m in matches if now <= m.get("start_dt", now) <= limit]
+
+        all_analyzed = [self.analyze_match(m) for m in window_matches]
+        all_analyzed = [a for a in all_analyzed if a["signals"]]
+
+        def _get_best_signal(analyzed_item: Dict[str, Any], allowed_keys: List[str]) -> Optional[Dict[str, Any]]:
+            best = None
+            for k in allowed_keys:
+                s = analyzed_item["signals"].get(k)
+                if s and (best is None or s["confidence"] > best["confidence"]):
+                    best = s
+            return best
+
+        def _select_pool(allowed_keys: List[str], min_odd: float, max_odd: float, limit: int, exclude_codes: Optional[Set[str]] = None) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+            pool = []
+            for a in all_analyzed:
+                code = a["match"]["code"]
+                if exclude_codes is not None and code in exclude_codes:
+                    continue
+                s = _get_best_signal(a, allowed_keys)
+                if s and min_odd <= s["odd"] <= max_odd:
+                    pool.append((a, s))
+            pool.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
+            chosen = pool[:limit]
+            if exclude_codes is not None:
+                for a, _ in chosen:
+                    exclude_codes.add(a["match"]["code"])
+            return chosen
+
+        def _pack_coupon(title: str, desc: str, risk_badge: str, items: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> Dict[str, Any]:
+            total_odd = 1.0
+            picks = []
+            for a, s in items:
+                total_odd *= s["odd"]
+                picks.append({
+                    "match": f"{a['match']['home']} - {a['match']['away']}",
+                    "league": a["match"]["league"],
+                    "time": f"{a['match']['date']} {a['match']['time']}",
+                    "pick": s["pick"],
+                    "odd": s["odd"],
+                    "prob": s["prob"],
+                    "confidence": s.get("confidence", 0.0),
+                    "reason": s["reasons"][0] if s["reasons"] else "",
+                })
+            return {
+                "title": title,
+                "desc": desc,
+                "risk_badge": risk_badge,
+                "total_odd": round(total_odd, 2),
+                "picks": picks,
+            }
+
+        used_codes: Set[str] = set()
+
+        # 1. 🟢 4 Saatlik Kasa Katlayıcı (Garanti / Düşük Risk, 2-3 Maç)
+        garanti = _select_pool(
+            allowed_keys=["ms_banko", "ust_25", "alt_taktigi", "kg_var", "takim_iki_yari_gol"],
+            min_odd=1.25,
+            max_odd=1.65,
+            limit=3,
+            exclude_codes=used_codes,
+        )
+
+        # 2. 🔵 4 Saatlik İdeal Kombine (Dengeli / Orta-Düşük Risk, 3 Maç)
+        ideal = _select_pool(
+            allowed_keys=["kg_var", "ust_25", "tg_aralik", "korner", "takim_iki_yari_gol", "kombo"],
+            min_odd=1.45,
+            max_odd=1.95,
+            limit=3,
+            exclude_codes=used_codes,
+        )
+
+        # 3. 🟡 4 Saatlik Değer & Fırsat (Orta Risk, 3 Maç)
+        value = _select_pool(
+            allowed_keys=["value_bet", "kombo", "iy_ust", "ust_35"],
+            min_odd=1.60,
+            max_odd=2.50,
+            limit=3,
+            exclude_codes=used_codes,
+        )
+
+        # 4. 🔴 4 Saatlik Sürpriz Vurgun (Yüksek Risk, 2-3 Maç)
+        surpriz = _select_pool(
+            allowed_keys=["arti_6_gol", "iyms_surpriz", "kesin_skor", "ust_35", "iki_yari_kg"],
+            min_odd=2.00,
+            max_odd=15.00,
+            limit=3,
+            exclude_codes=None,
+        )
+
+        return {
+            "window_hours": actual_hours,
+            "start_time": now.strftime("%H:%M"),
+            "end_time": limit.strftime("%H:%M"),
+            "match_count": len(window_matches),
+            "coupons": [
+                _pack_coupon(
+                    "🟢 1. YAKLAŞAN GARANTİ KUPON (Düşük Risk)",
+                    "Önümüzdeki saatlerin en yüksek güvenli banko tercihleri.",
+                    "Düşük Risk",
+                    garanti,
+                ),
+                _pack_coupon(
+                    "🔵 2. YAKLAŞAN İDEAL KOMBİNE (Dengeli Risk)",
+                    "Dengeli oran ve yüksek olasılıklı karma tercihler.",
+                    "Dengeli",
+                    ideal,
+                ),
+                _pack_coupon(
+                    "🟡 3. YAKLAŞAN DEĞER & FIRSAT (Orta Risk)",
+                    "Modelin piyasaya göre değer yakaladığı (+EV) yüksek oranlar.",
+                    "Orta Risk",
+                    value,
+                ),
+                _pack_coupon(
+                    "🔴 4. YAKLAŞAN SÜRPRİZ VURGUN (Yüksek Risk)",
+                    "Kesin skor, +6 gol ve İY/MS geri dönüşlerinden oluşan sürpriz bomba.",
+                    "Yüksek Risk",
+                    surpriz,
+                ),
+            ],
         }
 
     @staticmethod
