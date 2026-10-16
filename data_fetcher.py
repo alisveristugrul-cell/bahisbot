@@ -372,14 +372,50 @@ class GlobalMatchDataFetcher:
                 elif abs(sov - 10.5) < 0.1:
                     odds["korner_105_ust"] = _get_odd(m, 2)
 
+            # NOT: MTID 455 / 457 (takım iki yarıda gol) ve 225 (kırmızı kart) eşleşmeleri
+            # oran tutarlılık testinden geçemedi; yanlış bahis önermemek için devre dışı.
+
+            # 301: Toplam Kart Puanı / Kart Alt/Üst
+            elif mtid == 301:
+                if abs(sov - 3.5) < 0.1:
+                    odds["kart_35_alt"] = _get_odd(m, 1)
+                    odds["kart_35_ust"] = _get_odd(m, 2)
+                elif abs(sov - 4.5) < 0.1:
+                    odds["kart_45_alt"] = _get_odd(m, 1)
+                    odds["kart_45_ust"] = _get_odd(m, 2)
+                elif abs(sov - 2.5) < 0.1:
+                    odds["kart_25_alt"] = _get_odd(m, 1)
+                    odds["kart_25_ust"] = _get_odd(m, 2)
+
+            # 218: İlk Yarı Korner Alt/Üst
+            elif mtid == 218 and abs(sov - 4.5) < 0.1:
+                odds["iy_korner_45_alt"] = _get_odd(m, 1)
+                odds["iy_korner_45_ust"] = _get_odd(m, 2)
+
             # 5: İY / MS (1/2 ve 2/1 sürprizleri dahil)
             elif mtid == 5:
                 odds["iyms_1_1"] = _get_odd(m, 1)
-                odds["iyms_x_1"] = _get_odd(m, 4)
-                odds["iyms_2_1"] = _get_odd(m, 7)
+                odds["iyms_1_x"] = _get_odd(m, 2)
                 odds["iyms_1_2"] = _get_odd(m, 3)
+                odds["iyms_x_1"] = _get_odd(m, 4)
+                odds["iyms_x_x"] = _get_odd(m, 5)
                 odds["iyms_x_2"] = _get_odd(m, 6)
+                odds["iyms_2_1"] = _get_odd(m, 7)
+                odds["iyms_2_x"] = _get_odd(m, 8)
                 odds["iyms_2_2"] = _get_odd(m, 9)
+
+            # 777: Maç Skoru (Kesin Skor)
+            elif mtid == 777:
+                for o in m.get("OCA", []):
+                    on = o.get("ON", "").strip()
+                    oval = o.get("O")
+                    if not (isinstance(oval, (int, float)) and oval > 1.0):
+                        continue
+                    if ":" in on:
+                        h_s, a_s = on.split(":", 1)
+                        odds[f"skor_{h_s}_{a_s}"] = float(oval)
+                    elif on.lower() == "diğer":
+                        odds["skor_diger"] = float(oval)
 
         return {k: v for k, v in odds.items() if v is not None}
 
@@ -404,7 +440,7 @@ class GlobalMatchDataFetcher:
                 }
 
         events = sg.get("EA", [])
-        today_str = datetime.now().strftime("%d.%m.%Y")
+        now = datetime.now()
         matches: List[Dict[str, Any]] = []
 
         for ev in events:
@@ -426,9 +462,19 @@ class GlobalMatchDataFetcher:
             date_str = ev.get("D", "")
             time_str = ev.get("T", "")
 
-            if only_today_and_tomorrow and date_str and date_str != today_str:
-                #Tarih filtresi istenirse sadece yakın maçları tut
-                pass
+            try:
+                start_dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+            except ValueError:
+                continue
+            # Başlamış / bahsi kapanmış maçları alma
+            if start_dt <= now:
+                continue
+            if only_today_and_tomorrow and (start_dt - now).days >= 2:
+                continue
+
+            # MBS (minimum bahis sayısı) MS marketinden okunur
+            ms_market = next((mk for mk in ma_list if mk.get("MTID") == 1), {})
+            mbs_val = ms_market.get("MBS", 1)
 
             home_name = ev["HN"].strip()
             away_name = ev["AN"].strip()
@@ -452,14 +498,15 @@ class GlobalMatchDataFetcher:
                 "league": lg_info["name"],
                 "country": lg_info["country"],
                 "league_order": lg_info["order"],
-                "mbs": ev.get("MBS", 1),
+                "mbs": mbs_val,
+                "start_dt": start_dt,
                 "odds": odds,
                 "espn": espn_info,
             }
             matches.append(match_obj)
 
-        # Popüler ligleri ve yakın saatli maçları öne sırala
-        matches.sort(key=lambda x: (x["date"], x["time"], x["league_order"]))
+        # En yakın başlayan maçlar önce (gerçek tarih-saate göre)
+        matches.sort(key=lambda x: (x["start_dt"], x["league_order"]))
         return matches[:max_matches]
 
 

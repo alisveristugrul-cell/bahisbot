@@ -115,13 +115,23 @@ class BettingBotFormatter:
         matches = self.get_matches()
         coupons = self.analyzer.build_smart_coupons(matches)
         lines = [
-            "🎫 <b>GÜNÜN ALGORİTMİK HAZIR KUPONLARI</b>",
-            f"<i>Dixon-Coles, Bivariate Poisson ve Çapraz Market (+EV) analizleriyle {len(matches)} maç taranarak oluşturuldu:</i>",
+            "🎫 <b>GÜNÜN 5 KADEMELİ KOMBİNE KUPONLARI (GARANTİDEN SÜRPRİZE)</b>",
+            f"<i>Dixon-Coles 9x9 matrisi ve Çapraz Market (+EV) modelleriyle {len(matches)} maç taranarak hazırlandı:</i>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
 
-        for key in ["banko", "ideal", "surpriz"]:
-            c = coupons[key]
+        tiered_keys = [
+            "kupon_1_garanti",
+            "kupon_2_ideal",
+            "kupon_3_value",
+            "kupon_4_agresif",
+            "kupon_5_bomba",
+        ]
+
+        for key in tiered_keys:
+            c = coupons.get(key)
+            if not c:
+                continue
             lines.append(f"<b>{c['title']}</b>")
             lines.append(f"<i>{c['desc']}</i>")
             if not c["picks"]:
@@ -134,8 +144,66 @@ class BettingBotFormatter:
                     f"     📌 <i>{p['reason']}</i>"
                 )
             lines.append(f"🔥 <b>Toplam Kupon Oranı: {c['total_odd']:.2f}</b>")
+            lines.append("──────────────────────")
+
+        lines.append(
+            "💡 <i>Absürt oranlı sistem denemeleri için <b>/sistem</b> komutunu veya aşağıdaki sistem butonunu kullanabilirsiniz.</i>"
+        )
+        return "\n".join(lines)
+
+    def format_system_coupons(self) -> str:
+        matches = self.get_matches()
+        coupons = self.analyzer.build_smart_coupons(matches)
+        lines = [
+            "🎰 <b>GÜNÜN ABSÜRT ORANLI 2 SİSTEM KUPONU PAKETİ</b>",
+            "<i>(İY/MS 1/2-2/1 Geri Dönüşler, +6 Gol, İki Yarı KG ve Yüksek Skor Denemeleri)</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        for s_key in ["sistem_8_kaos", "sistem_10_skor"]:
+            sc = coupons.get(s_key)
+            if not sc:
+                continue
+            lines.append(f"<b>{sc['title']}</b>")
+            lines.append(f"<i>{sc['desc']}</i>")
+            lines.append(f"📋 <b>{sc['system_formula']}</b>")
+            lines.append(f"💰 <b>{sc['sample_payout']}</b>\n")
+            for idx, p in enumerate(sc["picks"], 1):
+                lines.append(
+                    f"  {idx}) <b>{p['match']}</b> ({p['time']})\n"
+                    f"     👉 <b>{p['pick']}</b> | Oran: <b>{p['odd']:.2f}</b>\n"
+                    f"     📌 <i>{p['reason']}</i>"
+                )
             lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
+        lines.append(
+            "⚠️ <b>Sistem Oynama Taktikleri:</b>\n"
+            "• Bu kuponlar 'hepsi gelsin' diye oynanmaz; 8 maçtan 4 tanesi veya 10 maçtan 4-5 tanesi geldiğinde bile kasayı katlamak için sistem olarak işaretlenir!\n"
+            "• Kasanızın en fazla %5-%10'unu bu absürt sistemlere ayırmanız önerilir."
+        )
+        return "\n".join(lines)
+
+    def format_bankroll_plan(self, amount: float = 1000.0) -> str:
+        plan = self.analyzer.get_bankroll_plan(total_bankroll=amount)
+        lines = [
+            f"💰 <b>AKILLI KASA YÖNETİMİ & PORTFÖY DAĞITIM PLANI ({amount:,.0f} ₺)</b>",
+            "<i>Profesyonel bahis sendikalarının uyguladığı risk ağırlıklı bakiye dağılımı:</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        total_target = 0.0
+        for item in plan:
+            lines.append(
+                f"<b>{item['name']}:</b>\n"
+                f"  • Kasa Payı: <b>%{item['pct']} ({item['stake']} ₺)</b>\n"
+                f"  • Tek Kupon Tutarsa Tahmini Hedef: <b>{item['target_win']:.1f} ₺</b>"
+            )
+            total_target += item["target_win"]
+            lines.append("──────────────────────")
+        lines.append(
+            f"🎯 <b>Strateji Mantığı:</b>\n"
+            f"1. ve 2. Garanti/İdeal kuponlar ana kasayı korur ve büyütür.\n"
+            f"3., 4., 5. ve Sistem kuponları ise küçük miktarlarla büyük patlama (asimetrik getiri) hedefler."
+        )
         return "\n".join(lines)
 
     def format_match_xray(self, query: str) -> str:
@@ -227,30 +295,45 @@ class TelegramBettingBot:
 
     STRATEGY_BUTTONS = [
         [
-            {"text": "🎯 KG Var Taktiği", "callback_data": "strat:kg_var"},
-            {"text": "🏆 MS Favori/Value", "callback_data": "strat:ms_banko"},
+            {"text": "🎯 KG Var", "callback_data": "strat:kg_var"},
+            {"text": "🏆 MS Banko/Value", "callback_data": "strat:ms_banko"},
         ],
         [
             {"text": "🔥 2.5 Üst Taktiği", "callback_data": "strat:ust_25"},
-            {"text": "🚀 3.5 Üst Fırtınası", "callback_data": "strat:ust_35"},
+            {"text": "🛡️ 2.5 Alt (Duvar)", "callback_data": "strat:alt_taktigi"},
         ],
         [
+            {"text": "🚀 3.5 Üst Fırtınası", "callback_data": "strat:ust_35"},
             {"text": "💣 +6 Gol (Kaos)", "callback_data": "strat:arti_6_gol"},
+        ],
+        [
             {"text": "⚡ İki Yarı KG (Evet/Evet)", "callback_data": "strat:iki_yari_kg"},
+            {"text": "🏠 Ev/Dep İki Yarı Gol", "callback_data": "strat:takim_iki_yari_gol"},
+        ],
+        [
+            {"text": "🔄 İY/MS Geri Dönüş (1/2-2/1)", "callback_data": "strat:iyms_surpriz"},
+            {"text": "🎯 Kesin Skor Sniper", "callback_data": "strat:kesin_skor"},
+        ],
+        [
+            {"text": "🟨 Kart & Korner Radarı", "callback_data": "strat:kart_korner"},
+            {"text": "⚖️ 2-3 / 4-5 Gol Aralığı", "callback_data": "strat:tg_aralik"},
         ],
         [
             {"text": "⏱️ İlk Yarı 1.5 Üst", "callback_data": "strat:iy_ust"},
             {"text": "💎 Kombo (KG/MS & Üst)", "callback_data": "strat:kombo"},
         ],
         [
-            {"text": "📐 Korner 9.5 Üst", "callback_data": "strat:korner"},
-            {"text": "🧠 Sharp Value (+EV)", "callback_data": "strat:value_bet"},
+            {"text": "🧠 Sharp Value Bet (+EV)", "callback_data": "strat:value_bet"},
+            {"text": "💰 Akıllı Kasa Dağıtımı", "callback_data": "action:kasa"},
         ],
         [
-            {"text": "🎫 Günün Hazır Kuponları (Banko / İdeal / Sürpriz)", "callback_data": "action:coupons"},
+            {"text": "🎫 5 Kademeli Kuponlar (Garanti ➔ Bomba)", "callback_data": "action:coupons"},
         ],
         [
-            {"text": "📚 Neye Göre Tahmin Veriyor? (Global Modeller)", "callback_data": "action:models"},
+            {"text": "🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)", "callback_data": "action:system"},
+        ],
+        [
+            {"text": "📚 Global Modeller", "callback_data": "action:models"},
             {"text": "🔄 Bülteni Yenile", "callback_data": "action:refresh"},
         ],
     ]
@@ -317,9 +400,15 @@ class TelegramBettingBot:
             "/kg": "kg_var",
             "/ms": "ms_banko",
             "/ust25": "ust_25",
+            "/alt": "alt_taktigi",
             "/ust35": "ust_35",
             "/arti6": "arti_6_gol",
             "/ikiyarikg": "iki_yari_kg",
+            "/takimgol": "takim_iki_yari_gol",
+            "/iyms": "iyms_surpriz",
+            "/skor": "kesin_skor",
+            "/kart": "kart_korner",
+            "/tgaralik": "tg_aralik",
             "/iyust": "iy_ust",
             "/kombo": "kombo",
             "/korner": "korner",
@@ -333,17 +422,20 @@ class TelegramBettingBot:
                 "<b>Inverse Multi-Market Poisson (xG)</b>, <b>Half-Split Tempo</b> ve "
                 "<b>Sharp Value (+EV)</b> modelleriyle tarar.\n\n"
                 "👇 <b>Aşağıdaki butonlardan istediğiniz taktiği seçebilir veya komutları kullanabilirsiniz:</b>\n"
+                "• <code>/kupon</code> — 🎫 5 Kademeli Günlük Kupon (Garanti ➔ Bomba)\n"
+                "• <code>/sistem</code> — 🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)\n"
+                "• <code>/kasa &lt;tutar&gt;</code> — 💰 Akıllı Kasa Dağıtım Planı (Örn: <code>/kasa 1000</code>)\n"
                 "• <code>/kg</code> — 🎯 KG Var Taktiği\n"
                 "• <code>/ms</code> — 🏆 MS Favori & Value Taktiği\n"
-                "• <code>/ust25</code> — 🔥 2.5 Üst Taktiği\n"
-                "• <code>/ust35</code> — 🚀 3.5 Üst Gol Fırtınası\n"
-                "• <code>/arti6</code> — 💣 +6 Gol (Ultra Varyans) Taktiği\n"
+                "• <code>/ust25</code> / <code>/alt</code> — 🔥 2.5 Üst / 🛡️ 2.5 Alt (Duvar)\n"
+                "• <code>/ust35</code> / <code>/arti6</code> — 🚀 3.5 Üst / 💣 +6 Gol (Kaos)\n"
                 "• <code>/ikiyarikg</code> — ⚡ İki Yarıda da KG Var (Evet/Evet)\n"
-                "• <code>/iyust</code> — ⏱️ İlk Yarı 1.5 Üst Taktiği\n"
-                "• <code>/kombo</code> — 💎 KG/MS & 2.5 Üst Kombo\n"
-                "• <code>/korner</code> — 📐 Korner 9.5 Üst Taktiği\n"
+                "• <code>/takimgol</code> — 🏠 Ev/Dep Her İki Yarıda Gol Atar\n"
+                "• <code>/iyms</code> — 🔄 İY/MS Geri Dönüşler (1/2-2/1) & X/1-X/2\n"
+                "• <code>/skor</code> — 🎯 Dixon-Coles Kesin Skor Sniper\n"
+                "• <code>/kart</code> — 🟨 Kart & Korner Baskı Radarı\n"
+                "• <code>/tgaralik</code> — ⚖️ 2-3 Gol & 4-5 Gol Aralığı\n"
                 "• <code>/value</code> — 🧠 Oran Sapması (+EV) Value Bet\n"
-                "• <code>/kupon</code> — 🎫 Günün 3 Hazır Kuponu\n"
                 "• <code>/analiz TakımAdı</code> — 🔬 Maç X-Ray Analizi (Örn: <code>/analiz Chelsea</code>)\n"
                 "• <code>/oto_ac</code> / <code>/oto_kapat</code> — 🔔 Otomatik Fırsat Bildirimi"
             )
@@ -355,6 +447,13 @@ class TelegramBettingBot:
 
         elif cmd == "/kupon":
             self.send_message(chat_id, self.formatter.format_coupons(), show_menu=True)
+
+        elif cmd == "/sistem":
+            self.send_message(chat_id, self.formatter.format_system_coupons(), show_menu=True)
+
+        elif cmd == "/kasa":
+            amt = float(arg) if arg.replace(".", "", 1).isdigit() else 1000.0
+            self.send_message(chat_id, self.formatter.format_bankroll_plan(amt), show_menu=True)
 
         elif cmd == "/stratejiler":
             self.send_message(chat_id, self.formatter.format_methodology_explanation(), show_menu=True)
@@ -419,13 +518,21 @@ class TelegramBettingBot:
     def _register_bot_commands(self) -> None:
         commands = [
             {"command": "menu", "description": "📋 İnteraktif Taktik & Analiz Menüsü"},
-            {"command": "kupon", "description": "🎫 Günün Hazır Kuponları (Banko / İdeal / Sürpriz)"},
-            {"command": "kg", "description": "🎯 KG Var (BTTS Sniper) Taktiği"},
-            {"command": "ms", "description": "🏆 MS (Maç Sonucu) Favori & Value Taktiği"},
+            {"command": "kupon", "description": "🎫 5 Kademeli Günlük Kuponlar (Garanti ➔ Bomba)"},
+            {"command": "sistem", "description": "🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)"},
+            {"command": "kasa", "description": "💰 Akıllı Kasa Dağıtım Planı (Örn: /kasa 1000)"},
+            {"command": "kg", "description": "🎯 KG Var Taktiği"},
+            {"command": "ms", "description": "🏆 MS Banko & Value Taktiği"},
             {"command": "ust25", "description": "🔥 2.5 Üst Gol Taktiği"},
+            {"command": "alt", "description": "🛡️ 2.5 Alt (Savunma Duvarı) Taktiği"},
             {"command": "ust35", "description": "🚀 3.5 Üst Gol Fırtınası"},
             {"command": "arti6", "description": "💣 +6 Gol (Ultra Varyans / Kaos) Taktiği"},
             {"command": "ikiyarikg", "description": "⚡ İki Yarıda da KG Var (Evet/Evet) Taktiği"},
+            {"command": "takimgol", "description": "🏠 Ev/Dep Her İki Yarıda Gol Atar"},
+            {"command": "iyms", "description": "🔄 İY/MS Geri Dönüşler (1/2-2/1) & X/1-X/2"},
+            {"command": "skor", "description": "🎯 Dixon-Coles Kesin Skor Sniper"},
+            {"command": "kart", "description": "🟨 Kart & Korner Baskı Radarı"},
+            {"command": "tgaralik", "description": "⚖️ 2-3 Gol & 4-5 Gol Aralığı"},
             {"command": "iyust", "description": "⏱️ İlk Yarı 1.5 Üst Erken Baskı Taktiği"},
             {"command": "kombo", "description": "💎 KG & 2.5 Üst / MS & 2.5 Üst Kombo"},
             {"command": "korner", "description": "📐 Korner 9.5 Üst Kanat Baskısı Taktiği"},
@@ -507,6 +614,10 @@ class TelegramBettingBot:
                             self.send_message(chat_id, reply, show_menu=True)
                         elif data == "action:coupons":
                             self.send_message(chat_id, self.formatter.format_coupons(), show_menu=True)
+                        elif data == "action:system":
+                            self.send_message(chat_id, self.formatter.format_system_coupons(), show_menu=True)
+                        elif data == "action:kasa":
+                            self.send_message(chat_id, self.formatter.format_bankroll_plan(1000.0), show_menu=True)
                         elif data == "action:models":
                             self.send_message(chat_id, self.formatter.format_methodology_explanation(), show_menu=True)
                         elif data == "action:refresh":
@@ -540,10 +651,12 @@ def run_cli_demo(formatter: BettingBotFormatter, strategy: Optional[str] = None,
         return
 
     # Varsayılan kapsamlı demo raporu
-    for skey in ["kg_var", "ms_banko", "ust_25", "arti_6_gol", "iki_yari_kg", "value_bet"]:
+    for skey in ["kg_var", "ms_banko", "ust_25", "alt_taktigi", "arti_6_gol", "iki_yari_kg", "iyms_surpriz", "kesin_skor", "value_bet"]:
         print(strip_html(formatter.format_strategy_picks(skey, top_n=3)))
         print("\n")
     print(strip_html(formatter.format_coupons()))
+    print("\n" + strip_html(formatter.format_system_coupons()))
+    print("\n" + strip_html(formatter.format_bankroll_plan(1000.0)))
 
 
 def main() -> None:

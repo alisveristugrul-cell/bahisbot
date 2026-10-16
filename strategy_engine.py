@@ -149,6 +149,36 @@ class MatchQuantitativeAnalyzer:
             "short": "Value Bet (+EV)",
             "desc": "Dixon-Coles model olasılığının bahis şirketinin ima ettiği olasılıktan anlamlı derecede yüksek olduğu (+EV ≥ %5) matematiksel fırsatlar.",
         },
+        "alt_taktigi": {
+            "title": "🛡️ 2.5 Alt & Kısır Maç (Savunma Duvarı) Taktiği",
+            "short": "2.5 Alt / Kısır",
+            "desc": "Toplam gol beklentisi λ_toplam ≤ 2.25 olan, savunma disiplini yüksek ve Dixon-Coles 0-0, 1-0, 0-1, 1-1 olasılığı %56+ olan düşük tempolu maçlar.",
+        },
+        "takim_iki_yari_gol": {
+            "title": "🏠 Ev/Dep Her İki Yarıda da Gol Atar Taktiği",
+            "short": "İki Yarıda Gol Atar",
+            "desc": "Ağır favori takımın hücum gücünün (λ_takım ≥ 1.85) maçın iki devresine de yayıldığı, hem 1. Yarı hem 2. Yarı gol atma olasılığı yüksek olan maçlar.",
+        },
+        "kart_korner": {
+            "title": "🟨 Kart & Korner Baskı Radarı",
+            "short": "Kart & Korner",
+            "desc": "Tansiyonu, derbi/rekabet seviyesi ve kanat baskısı yüksek maçlarda Kart 3.5/4.5 Üst, Kırmızı Kart ve Korner 9.5 Üst/Alt tercihleri.",
+        },
+        "iyms_surpriz": {
+            "title": "🔄 İY/MS Geri Dönüşler (1/2 - 2/1) & İkinci Yarıda Çözenler (X/1 - X/2)",
+            "short": "İY/MS Sürpriz",
+            "desc": "Efsane geri dönüş potansiyeli taşıyan (1/2, 2/1 — Oran 20.00-35.00) ve ilk yarı temkinli geçip 2. yarıda favorinin açtığı (X/1, X/2 — Oran 4.50-6.50) maçlar.",
+        },
+        "kesin_skor": {
+            "title": "🎯 Dixon-Coles Kesin Skor (Correct Score) Sniper",
+            "short": "Kesin Skor",
+            "desc": "Dixon-Coles 9x9 matrisinde gerçek olasılığı en yüksek ve piyasa oranına göre en değerli kesin skor tahminleri (1-1, 2-1, 1-2, 2-0, 2-2, 3-1).",
+        },
+        "tg_aralik": {
+            "title": "⚖️ Toplam Gol Aralığı (2-3 Gol İdeal & 4-5 Gol Yüksek Bant)",
+            "short": "Toplam Gol Aralığı",
+            "desc": "Aşırı uç maçlar yerine tam 2-3 Gol (Oran 1.75-1.95) ve 4-5 Gol (Oran 2.80-3.60) bandına oturan dengeli kupon tamamlayıcıları.",
+        },
     }
 
     def analyze_match(self, match: Dict[str, Any], espn_details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -359,6 +389,7 @@ class MatchQuantitativeAnalyzer:
             balance_factor=balance_factor,
             top_3_scores=top_3_scores,
             form_notes=form_notes,
+            exact_scores=exact_scores,
         )
 
         return {
@@ -413,6 +444,7 @@ class MatchQuantitativeAnalyzer:
         balance_factor: float,
         top_3_scores: List[Tuple[str, float]],
         form_notes: List[str],
+        exact_scores: Optional[List[Tuple[str, float]]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         signals: Dict[str, Dict[str, Any]] = {}
 
@@ -539,12 +571,10 @@ class MatchQuantitativeAnalyzer:
         # 6. İKİ YARIDA DA KG VAR (1Y EVET & 2Y EVET) TAKTİĞİ
         # ------------------------------------------------------------------
         # Bu taktik için tek taraflı 5-0 maç değil, DENGELİ YÜKSEK TEMPO (λ_ev >= 1.25 ve λ_dep >= 1.15) gerekir!
-        both_kg_odd = odds.get("iki_yari_kg_var")
-        if not both_kg_odd and odds.get("iy_kg_var") and odds.get("ikinci_yari_kg_var"):
-            both_kg_odd = round(odds["iy_kg_var"] * odds["ikinci_yari_kg_var"] * 0.95, 2)
+        both_kg_odd = odds.get("iki_yari_kg_var")  # Sadece bültende AÇIK olan gerçek oran
 
-        if lam_h >= 1.25 and lam_a >= 1.15 and p_both_halves_btts >= 0.065:
-            display_odd = both_kg_odd or round(1.0 / max(0.05, p_both_halves_btts * 1.12), 2)
+        if both_kg_odd and lam_h >= 1.25 and lam_a >= 1.15 and p_both_halves_btts >= 0.065:
+            display_odd = both_kg_odd
             ev = (p_both_halves_btts * display_odd) - 1.0
             score = (p_both_halves_btts * 100) * 4.2 + (balance_factor * 25.0) + (p_1h_btts * 100 * 0.8)
             reasons = [
@@ -701,6 +731,207 @@ class MatchQuantitativeAnalyzer:
                 ],
             }
 
+        # ------------------------------------------------------------------
+        # 11. 🛡️ 2.5 ALT & KISIR MAÇ (SAVUNMA DUVARI) TAKTİĞİ
+        # ------------------------------------------------------------------
+        p_under25 = 1.0 - p_over25
+        p_under35 = 1.0 - p_over35
+        p_btts_no = 1.0 - p_btts
+        if lam_total <= 2.35 and p_under25 >= 0.53:
+            alt_pick = "2.5 Gol Alt"
+            alt_odd = odds.get("alt_25")
+            alt_prob = p_under25
+            if not alt_odd and odds.get("alt_35") and p_under35 >= 0.70:
+                alt_pick = "3.5 Gol Alt"
+                alt_odd = odds.get("alt_35")
+                alt_prob = p_under35
+            elif not alt_odd and odds.get("kg_yok") and p_btts_no >= 0.55:
+                alt_pick = "KG Yok (Karşılıklı Gol Yok)"
+                alt_odd = odds.get("kg_yok")
+                alt_prob = p_btts_no
+
+            if alt_odd:
+                ev = (alt_prob * alt_odd) - 1.0
+                score = (alt_prob * 100) * 0.75 + max(0.0, (2.40 - lam_total) * 20.0) + max(0.0, ev * 35)
+                signals["alt_taktigi"] = {
+                    "pick": alt_pick,
+                    "odd": alt_odd,
+                    "prob": round(alt_prob * 100, 1),
+                    "confidence": round(min(97.0, score), 1),
+                    "ev_pct": round(ev * 100, 1),
+                    "reasons": [
+                        f"Savunma Duvarı Modeli: Toplam beklenen gol λ_toplam={lam_total:.2f} (Ev {lam_h:.2f} + Dep {lam_a:.2f})",
+                        f"Dixon-Coles düşük skor olasılığı %{alt_prob*100:.1f} (En olası skorlar: {', '.join(s for s, _ in top_3_scores[:2])})",
+                    ],
+                }
+
+        # ------------------------------------------------------------------
+        # 12. 🏠 EV / DEP TAKIM 1.5 GOL ÜST TAKTİĞİ (doğrulanmış market: MTID 20 / 29)
+        # ------------------------------------------------------------------
+        p_ev_over15 = poisson_over_prob(1.5, lam_h)
+        p_dep_over15 = poisson_over_prob(1.5, lam_a)
+        team_cands = []
+        if odds.get("ev_ust_15") and lam_h >= 1.75:
+            team_cands.append((match["home"], "Ev Sahibi", odds["ev_ust_15"], p_ev_over15, lam_h))
+        if odds.get("dep_ust_15") and lam_a >= 1.75:
+            team_cands.append((match["away"], "Deplasman", odds["dep_ust_15"], p_dep_over15, lam_a))
+        team_cands = [c for c in team_cands if c[3] >= 0.50]
+        if team_cands:
+            name, side, t_odd, t_prob, t_lam = max(team_cands, key=lambda c: c[3])
+            ev = (t_prob * t_odd) - 1.0
+            signals["takim_iki_yari_gol"] = {
+                "pick": f"{side} ({name}) 1.5 Gol Üst",
+                "odd": t_odd,
+                "prob": round(t_prob * 100, 1),
+                "confidence": round(min(95.0, t_prob * 100 * 1.1 + t_lam * 6), 1),
+                "ev_pct": round(ev * 100, 1),
+                "reasons": [
+                    f"{name} gol beklentisi yüksek (λ={t_lam:.2f}); 2+ gol atma model olasılığı %{t_prob*100:.1f}",
+                ],
+            }
+
+        # ------------------------------------------------------------------
+        # 13. 🟨 KART ÜST (doğrulanmış market: MTID 301)
+        # ------------------------------------------------------------------
+        # Kart için takım/hakem verimiz yok; bu yüzden uydurma olasılık yerine
+        # bahis şirketinin marjdan arındırılmış kendi olasılığını kullanıyoruz.
+        for line in ("35", "45"):
+            k_ust, k_alt = odds.get(f"kart_{line}_ust"), odds.get(f"kart_{line}_alt")
+            if not (k_ust and k_alt):
+                continue
+            p_k, _ = strip_vig([k_ust, k_alt])
+            if p_k[0] >= 0.55 and k_ust >= 1.45:
+                signals["kart_korner"] = {
+                    "pick": f"Toplam Kart {line[0]}.{line[1]} Üst",
+                    "odd": k_ust,
+                    "prob": round(p_k[0] * 100, 1),
+                    "confidence": round(min(85.0, p_k[0] * 100 * 1.05), 1),
+                    "ev_pct": 0.0,
+                    "reasons": [
+                        f"Piyasa (marjsız) olasılığı %{p_k[0]*100:.1f}. Not: Kart için hakem/takım verisi olmadığından bağımsız model edge'i yoktur.",
+                    ],
+                }
+                break
+        # ------------------------------------------------------------------
+        # 14. 🔄 İY/MS GERİ DÖNÜŞLER (1/2 - 2/1) & İKİNCİ YARIDA ÇÖZENLER (X/1 - X/2)
+        # ------------------------------------------------------------------
+        # Efsane Geri Dönüş: Maç tempolu (lambda >= 2.80), KG Var olasılığı yüksek
+        if lam_total >= 2.80 and p_btts >= 0.54:
+            if odds.get("iyms_1_2") and odds["iyms_1_2"] >= 18.0:
+                p_1_2 = max(0.035, min(0.09, (p_1h_btts * 0.45) * (p_away * 0.35)))
+                signals["iyms_surpriz"] = {
+                    "pick": f"İY/MS 1/2 (İlk Yarı {match['home']} / Maç Sonu {match['away']})",
+                    "odd": odds["iyms_1_2"],
+                    "prob": round(p_1_2 * 100, 1),
+                    "confidence": round(min(89.0, 58.0 + p_1_2 * 350 + chaos_index * 0.2), 1),
+                    "ev_pct": round(((p_1_2 * odds["iyms_1_2"]) - 1.0) * 100, 1),
+                    "reasons": [
+                        f"Efsane Geri Dönüş Radarı: {match['home']} maça hızlı başlayıp öne geçebilir ama maç sonu {match['away']} lehine yüksek hücum baskısı var",
+                        f"Kaos Endeksi: {chaos_index:.0f}/100 | İY/MS 1/2 Oranı: {odds['iyms_1_2']:.2f}",
+                    ],
+                }
+            elif odds.get("iyms_2_1") and odds["iyms_2_1"] >= 18.0:
+                p_2_1 = max(0.035, min(0.09, (p_1h_btts * 0.45) * (p_home * 0.35)))
+                signals["iyms_surpriz"] = {
+                    "pick": f"İY/MS 2/1 (İlk Yarı {match['away']} / Maç Sonu {match['home']})",
+                    "odd": odds["iyms_2_1"],
+                    "prob": round(p_2_1 * 100, 1),
+                    "confidence": round(min(89.0, 58.0 + p_2_1 * 350 + chaos_index * 0.2), 1),
+                    "ev_pct": round(((p_2_1 * odds["iyms_2_1"]) - 1.0) * 100, 1),
+                    "reasons": [
+                        f"Efsane Geri Dönüş Radarı: {match['away']} kontradan ilk yarıyı alabilir ancak ev sahibi {match['home']} ikinci yarıda geri dönme gücüne sahip",
+                        f"Kaos Endeksi: {chaos_index:.0f}/100 | İY/MS 2/1 Oranı: {odds['iyms_2_1']:.2f}",
+                    ],
+                }
+        elif p_home >= 0.52 and odds.get("iyms_x_1") and odds["iyms_x_1"] >= 3.80:
+            # İkinci Yarıda Çözen Favori (X/1)
+            p_x_1 = max(0.18, min(0.32, p_draw * 0.55 * p_home * 1.4))
+            signals["iyms_surpriz"] = {
+                "pick": f"İY/MS X/1 (İlk Yarı Berabere / Maç Sonu {match['home']})",
+                "odd": odds["iyms_x_1"],
+                "prob": round(p_x_1 * 100, 1),
+                "confidence": round(min(93.0, p_x_1 * 100 * 1.8 + p_home * 30), 1),
+                "ev_pct": round(((p_x_1 * odds["iyms_x_1"]) - 1.0) * 100, 1),
+                "reasons": [
+                    f"Favori İkinci Yarıda Çözer: {match['home']} temkinli başlayıp kilidi 2. yarıda açacak profilde",
+                    f"Dixon-Coles X/1 olasılığı %{p_x_1*100:.1f} (Oran: {odds['iyms_x_1']:.2f})",
+                ],
+            }
+        elif p_away >= 0.52 and odds.get("iyms_x_2") and odds["iyms_x_2"] >= 3.80:
+            # İkinci Yarıda Çözen Deplasman (X/2)
+            p_x_2 = max(0.18, min(0.32, p_draw * 0.55 * p_away * 1.4))
+            signals["iyms_surpriz"] = {
+                "pick": f"İY/MS X/2 (İlk Yarı Berabere / Maç Sonu {match['away']})",
+                "odd": odds["iyms_x_2"],
+                "prob": round(p_x_2 * 100, 1),
+                "confidence": round(min(93.0, p_x_2 * 100 * 1.8 + p_away * 30), 1),
+                "ev_pct": round(((p_x_2 * odds["iyms_x_2"]) - 1.0) * 100, 1),
+                "reasons": [
+                    f"Favori Deplasman İkinci Yarıda Çözer: İlk yarı direnç bekleniyor, 2. yarıda {match['away']} maçı koparır",
+                    f"Dixon-Coles X/2 olasılığı %{p_x_2*100:.1f} (Oran: {odds['iyms_x_2']:.2f})",
+                ],
+            }
+
+        # ------------------------------------------------------------------
+        # 15. 🎯 DİXON-COLES KESİN SKOR (CORRECT SCORE) SNIPER
+        # ------------------------------------------------------------------
+        # Sadece bültende (MTID 777) fiilen AÇIK olan kesin skorları öner!
+        matched_score = None
+        search_scores = exact_scores if exact_scores else top_3_scores
+        for sc, sc_prob in search_scores[:12]:
+            score_key = f"skor_{sc.replace('-', '_')}"
+            sc_odd = odds.get(score_key)
+            if sc_odd and sc_odd > 1.0 and sc_prob >= 0.05:
+                matched_score = (sc, sc_prob, sc_odd)
+                break
+
+        if matched_score:
+            best_score, best_score_prob, score_odd = matched_score
+            ev = (best_score_prob * score_odd) - 1.0
+            signals["kesin_skor"] = {
+                "pick": f"Skor: {best_score} (Dixon-Coles Model Skoru)",
+                "odd": score_odd,
+                "prob": round(best_score_prob * 100, 1),
+                "confidence": round(min(94.0, 65.0 + best_score_prob * 220 + max(0.0, ev * 15)), 1),
+                "ev_pct": round(ev * 100, 1),
+                "reasons": [
+                    f"Dixon-Coles 81 olası skor arasından bültende açık en yüksek yoğunluk: {best_score} (%{best_score_prob*100:.1f})",
+                    f"Bülten Kesin Skor Oranı: {score_odd:.2f} (Beklenen Değer: %{ev*100:+.1f})",
+                ],
+            }
+
+        # ------------------------------------------------------------------
+        # 16. ⚖️ TOPLAM GOL ARALIĞI (2-3 GOL & 4-5 GOL)
+        # ------------------------------------------------------------------
+        p_tg_2_3 = poisson_pmf(2, lam_total) + poisson_pmf(3, lam_total)
+        p_tg_4_5 = poisson_pmf(4, lam_total) + poisson_pmf(5, lam_total)
+        if odds.get("tg_2_3") and p_tg_2_3 >= 0.44:
+            ev = (p_tg_2_3 * odds["tg_2_3"]) - 1.0
+            signals["tg_aralik"] = {
+                "pick": "Toplam Gol 2-3 Gol (İdeal Bant)",
+                "odd": odds["tg_2_3"],
+                "prob": round(p_tg_2_3 * 100, 1),
+                "confidence": round(min(95.0, p_tg_2_3 * 100 * 1.35 + max(0.0, ev * 30)), 1),
+                "ev_pct": round(ev * 100, 1),
+                "reasons": [
+                    f"İdeal Gol Yoğunluğu: λ={lam_total:.2f} ile maçın tam 2 veya 3 golle bitme ihtimali %{p_tg_2_3*100:.1f}",
+                    f"2-3 Gol Oranı: {odds['tg_2_3']:.2f}",
+                ],
+            }
+        elif odds.get("tg_4_5") and p_tg_4_5 >= 0.26 and lam_total >= 3.05:
+            ev = (p_tg_4_5 * odds["tg_4_5"]) - 1.0
+            signals["tg_aralik"] = {
+                "pick": "Toplam Gol 4-5 Gol (Yüksek Bant)",
+                "odd": odds["tg_4_5"],
+                "prob": round(p_tg_4_5 * 100, 1),
+                "confidence": round(min(93.0, p_tg_4_5 * 100 * 1.8 + max(0.0, ev * 30)), 1),
+                "ev_pct": round(ev * 100, 1),
+                "reasons": [
+                    f"Yüksek Skor Bandı: λ={lam_total:.2f} ile maçın 4-5 gol aralığına oturma ihtimali %{p_tg_4_5*100:.1f}",
+                    f"4-5 Gol Oranı: {odds['tg_4_5']:.2f}",
+                ],
+            }
+
         return signals
 
     def scan_bulletin(
@@ -711,8 +942,7 @@ class MatchQuantitativeAnalyzer:
         fetcher: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Tüm bülteni tarayarak seçilen taktiğe (örn. 'kg_var', 'arti_6_gol', 'iki_yari_kg')
-        en uygun maçları güven skoruna göre sıralar.
+        Tüm bülteni tarayarak seçilen taktiğe en uygun maçları güven skoruna göre sıralar.
         """
         results: List[Dict[str, Any]] = []
         for m in matches:
@@ -742,45 +972,104 @@ class MatchQuantitativeAnalyzer:
 
     def build_smart_coupons(self, matches: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """
-        Günlük bültenden 3 farklı risk profilinde hazır kupon üretir:
-        1. Banko Kupon (Düşük Risk, 3 Maç, Oran ~2.40 - 3.50)
-        2. İdeal Değer Kuponu (Orta Risk, 4 Maç, KG Var / 2.5 Üst / Kombo, Oran ~5.00 - 10.00)
-        3. Sürpriz / Sistem Kaos Kuponu (Yüksek Oran, +6 Gol / İki Yarı KG / İY 1.5 Üst, Oran ~25.00+)
+        Günlük bültenden 5 Kademeli Kombine Kupon (Garantiden Sürprize) +
+        2 Adet Ekstra Absürt Oran Sistem Kuponu üretir.
         """
         all_analyzed = [self.analyze_match(m) for m in matches]
 
-        # 1. Banko Adayları (MS Banko veya 2.5 Üst / KG Var en yüksek olasılıklı)
-        banko_pool = []
-        for a in all_analyzed:
-            for k in ["ms_banko", "ust_25", "kg_var"]:
-                s = a["signals"].get(k)
-                if s and 1.32 <= s["odd"] <= 1.72 and s["prob"] >= 58.0:
-                    banko_pool.append((a, s))
-                    break
-        banko_pool.sort(key=lambda x: x[1]["prob"], reverse=True)
+        def _get_best_signal(analyzed_item: Dict[str, Any], allowed_keys: List[str]) -> Optional[Dict[str, Any]]:
+            best = None
+            for k in allowed_keys:
+                s = analyzed_item["signals"].get(k)
+                if s and (best is None or s["confidence"] > best["confidence"]):
+                    best = s
+            return best
 
-        # 2. İdeal Kupon Adayları (Value Bet, Kombo, KG Var, 2.5 Üst)
-        ideal_pool = []
-        used_codes_banko = {x[0]["match"]["code"] for x in banko_pool[:3]}
-        for a in all_analyzed:
-            if a["match"]["code"] in used_codes_banko:
-                continue
-            for k in ["value_bet", "kombo", "kg_var", "ust_25"]:
-                s = a["signals"].get(k)
-                if s and 1.50 <= s["odd"] <= 2.35 and s["confidence"] >= 60.0:
-                    ideal_pool.append((a, s))
-                    break
-        ideal_pool.sort(key=lambda x: (x[1]["confidence"], x[1]["odd"]), reverse=True)
+        used_codes: Set[str] = set()
 
-        # 3. Sürpriz / Sistem Kuponu (+6 Gol, İki Yarı KG, 3.5 Üst, İY 1.5 Üst)
-        surpriz_pool = []
+        def _select_pool(allowed_keys: List[str], min_odd: float, max_odd: float, min_conf: float, limit: int) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+            pool = []
+            for a in all_analyzed:
+                code = a["match"]["code"]
+                if code in used_codes:
+                    continue
+                s = _get_best_signal(a, allowed_keys)
+                if s and min_odd <= s["odd"] <= max_odd and s["confidence"] >= min_conf:
+                    pool.append((a, s))
+            pool.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
+            chosen = pool[:limit]
+            for a, _ in chosen:
+                used_codes.add(a["match"]["code"])
+            return chosen
+
+        # 1. 🟢 Kasa Katlayıcı Garanti Kupon (Düşük Risk, 3 Maç, Oran ~2.00 - 3.20)
+        garanti_picks = _select_pool(
+            allowed_keys=["ms_banko", "ust_25", "alt_taktigi", "kg_var"],
+            min_odd=1.28,
+            max_odd=1.65,
+            min_conf=65.0,
+            limit=3,
+        )
+
+        # 2. 🔵 İdeal Dengeli Karma Kupon (Orta-Düşük Risk, 4 Maç, Oran ~4.50 - 7.50)
+        ideal_picks = _select_pool(
+            allowed_keys=["kg_var", "ust_25", "tg_aralik", "alt_taktigi", "korner", "takim_iki_yari_gol"],
+            min_odd=1.45,
+            max_odd=1.95,
+            min_conf=62.0,
+            limit=4,
+        )
+
+        # 3. 🟡 Değer / Value Taktik Kuponu (Orta Risk, 4 Maç, Oran ~9.00 - 18.00)
+        value_picks = _select_pool(
+            allowed_keys=["value_bet", "kombo", "takim_iki_yari_gol", "iy_ust", "ust_25", "kg_var"],
+            min_odd=1.60,
+            max_odd=2.45,
+            min_conf=58.0,
+            limit=4,
+        )
+
+        # 4. 🟠 Yüksek Oranlı Sert Karma Kupon (Yüksek Risk, 4-5 Maç, Oran ~25.00 - 60.00)
+        agresif_picks = _select_pool(
+            allowed_keys=["iy_ust", "ust_35", "tg_aralik", "iyms_surpriz", "kombo", "kart_korner"],
+            min_odd=1.90,
+            max_odd=3.80,
+            min_conf=54.0,
+            limit=4,
+        )
+
+        # 5. 🔴 Bomba Sürpriz Vurgun Kuponu (Çok Yüksek Risk, 4 Maç, Oran ~70.00 - 250.00+)
+        bomba_picks = _select_pool(
+            allowed_keys=["arti_6_gol", "iki_yari_kg", "iyms_surpriz", "kesin_skor", "ust_35"],
+            min_odd=2.40,
+            max_odd=12.00,
+            min_conf=50.0,
+            limit=4,
+        )
+
+        # 6. 🎰 SİSTEM PAKETİ 1 (8 Maçta Sistem 4-5-6 "Kaos & Geri Dönüş")
+        # İY/MS 2/1 & 1/2 + +6 Gol + İki Yarıda KG Var
+        sistem_8_pool = []
         for a in all_analyzed:
-            for k in ["iki_yari_kg", "arti_6_gol", "iy_ust", "ust_35"]:
+            for k in ["iyms_surpriz", "arti_6_gol", "iki_yari_kg"]:
                 s = a["signals"].get(k)
-                if s and s["odd"] >= 2.40:
-                    surpriz_pool.append((a, s))
+                if s and s["odd"] >= 2.50:
+                    sistem_8_pool.append((a, s))
                     break
-        surpriz_pool.sort(key=lambda x: x[1]["confidence"], reverse=True)
+        sistem_8_pool.sort(key=lambda x: (x[1]["confidence"], x[1]["odd"]), reverse=True)
+        sistem_8_picks = sistem_8_pool[:8]
+
+        # 7. 🌌 SİSTEM PAKETİ 2 (10 Maçta Sistem 4-5 "Kesin Skor & Ultra Bomba")
+        # Kesin Skorlar + İY/MS 1/2-2/1 + +6 Gol
+        sistem_10_pool = []
+        for a in all_analyzed:
+            for k in ["kesin_skor", "iyms_surpriz", "arti_6_gol", "iki_yari_kg"]:
+                s = a["signals"].get(k)
+                if s and s["odd"] >= 3.20:
+                    sistem_10_pool.append((a, s))
+                    break
+        sistem_10_pool.sort(key=lambda x: (x[1]["odd"] * 0.4 + x[1]["confidence"] * 0.6), reverse=True)
+        sistem_10_picks = sistem_10_pool[:10]
 
         def _pack_coupon(title: str, desc: str, items: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> Dict[str, Any]:
             total_odd = 1.0
@@ -803,20 +1092,83 @@ class MatchQuantitativeAnalyzer:
                 "picks": picks,
             }
 
+        def _calc_system_combinations(n: int, k: int) -> int:
+            return math.comb(n, k)
+
+        # Sistem 8 İstatistikleri
+        c_8_4 = _calc_system_combinations(len(sistem_8_picks), 4) if len(sistem_8_picks) >= 4 else 0
+        c_8_5 = _calc_system_combinations(len(sistem_8_picks), 5) if len(sistem_8_picks) >= 5 else 0
+        avg_odd_s8 = sum(s["odd"] for _, s in sistem_8_picks) / max(1, len(sistem_8_picks))
+        sample_win_s8_4 = round((avg_odd_s8 ** 4), 1)
+
+        # Sistem 10 İstatistikleri
+        c_10_4 = _calc_system_combinations(len(sistem_10_picks), 4) if len(sistem_10_picks) >= 4 else 0
+        c_10_5 = _calc_system_combinations(len(sistem_10_picks), 5) if len(sistem_10_picks) >= 5 else 0
+        avg_odd_s10 = sum(s["odd"] for _, s in sistem_10_picks) / max(1, len(sistem_10_picks))
+        sample_win_s10_4 = round((avg_odd_s10 ** 4), 1)
+
         return {
-            "banko": _pack_coupon(
-                "🛡️ BANKO GÜVEN KUPONU (Düşük Risk)",
-                "Matematiksel tutma olasılığı en yüksek (%60+) 3 ana tercihten oluşur.",
-                banko_pool[:3],
+            "kupon_1_garanti": _pack_coupon(
+                "🟢 1. KASA KATLAYICI GARANTİ KUPON (Düşük Risk)",
+                "Matematiksel tutma olasılığı en yüksek (%65+) banko tercihlerden oluşur.",
+                garanti_picks,
             ),
-            "ideal": _pack_coupon(
-                "⚖️ İDEAL VALUE KUPONU (Orta Risk / Yüksek Değer)",
-                "Çapraz market korelasyonu ve +EV (Değer farkı) en yüksek 4 maçtan oluşur.",
-                ideal_pool[:4],
+            "kupon_2_ideal": _pack_coupon(
+                "🔵 2. İDEAL DENGELİ KARMA KUPON (Orta-Düşük Risk)",
+                "2.5 Alt, KG Var, 2-3 Gol, Ev 1.5 Üst ve Korner tercihlerinden oluşan ideal denge kuponu.",
+                ideal_picks,
             ),
-            "surpriz": _pack_coupon(
-                "💣 SÜRPRİZ / SİSTEM KAOS KUPONU (+6 Gol & İki Yarı KG & İY 1.5 Üst)",
-                "Yüksek varyanslı (Fat-Tail) maçlardan seçilen yüksek oranlı sistem kuponu.",
-                surpriz_pool[:3],
+            "kupon_3_value": _pack_coupon(
+                "🟡 3. DEĞER & TAKTİK KOMBİNE KUPONU (Orta Risk)",
+                "Sharp Value (+EV), Kombo (MS&Üst/KG&Üst) ve İki Yarıda Gol marketlerinden oluşan değer kuponu.",
+                value_picks,
             ),
+            "kupon_4_agresif": _pack_coupon(
+                "🟠 4. YÜKSEK ORANLI SERT KARMA KUPON (Yüksek Risk)",
+                "İY/MS X/1-X/2, 3.5 Üst, İY 1.5 Üst ve 4-5 Gol tercihlerinden oluşan yüksek çarpan kuponu.",
+                agresif_picks,
+            ),
+            "kupon_5_bomba": _pack_coupon(
+                "🔴 5. BOMBA SÜRPRİZ VURGUN KUPONU (Çok Yüksek Risk)",
+                "+6 Gol, İki Yarıda da KG Var (Evet/Evet) ve Kesin Skorlardan oluşan devasa oran kuponu.",
+                bomba_picks,
+            ),
+            "sistem_8_kaos": {
+                "title": "🎰 6. SİSTEM PAKETİ: 8 MAÇTA SİSTEM 4-5-6 (Kaos & Geri Dönüş)",
+                "desc": "İY/MS 2/1 & 1/2 + +6 Gol + İki Yarıda KG Var karması 8 yüksek oranlı maç.",
+                "system_formula": f"Önerilen Sistem: 4 ve 5 (Sistem 4 = {c_8_4} Kolon, Sistem 5 = {c_8_5} Kolon | Toplam: {c_8_4 + c_8_5} Kolon)",
+                "sample_payout": f"4 Maç Tutarsa Ortalama Çarpan: ~{sample_win_s8_4:.1f}x (5 maçta devasa katlama)",
+                "picks": _pack_coupon("", "", sistem_8_picks)["picks"],
+            },
+            "sistem_10_skor": {
+                "title": "🌌 7. SİSTEM PAKETİ: 10 MAÇTA SİSTEM 4-5 (Kesin Skor & Ultra Bomba)",
+                "desc": "Dixon-Coles Yüksek Skorlar + Efsane Geri Dönüşler (1/2 - 2/1) karması 10 maç.",
+                "system_formula": f"Önerilen Sistem: 4 veya 5 (Sistem 4 = {c_10_4} Kolon, Sistem 5 = {c_10_5} Kolon)",
+                "sample_payout": f"4 Maç Tutarsa Ortalama Çarpan: ~{sample_win_s10_4:.1f}x | 5 Maç Tutarsa Rekor Çarpan",
+                "picks": _pack_coupon("", "", sistem_10_picks)["picks"],
+            },
         }
+
+    @staticmethod
+    def get_bankroll_plan(total_bankroll: float = 1000.0) -> List[Dict[str, Any]]:
+        """1.000 ₺ (veya kullanıcının girdiği bakiye) için optimal portföy dağıtım kılavuzu."""
+        ratios = [
+            ("🟢 1. Kasa Katlayıcı Garanti", 0.35, 2.30),
+            ("🔵 2. İdeal Dengeli Karma", 0.25, 5.50),
+            ("🟡 3. Değer & Value Taktik", 0.15, 12.0),
+            ("🟠 4. Yüksek Oranlı Sert Karma", 0.10, 35.0),
+            ("🔴 5. Bomba Sürpriz Vurgun", 0.05, 120.0),
+            ("🎰 6. Sistem 8 (Kaos & Geri Dönüş)", 0.05, 450.0),
+            ("🌌 7. Sistem 10 (Kesin Skor & Ultra)", 0.05, 850.0),
+        ]
+        plan = []
+        for name, pct, avg_odd in ratios:
+            stake = round(total_bankroll * pct, 1)
+            target_win = round(stake * avg_odd, 1)
+            plan.append({
+                "name": name,
+                "pct": int(pct * 100),
+                "stake": stake,
+                "target_win": target_win,
+            })
+        return plan
