@@ -27,10 +27,11 @@ def _normalize_team_name(name: str) -> str:
     if not name:
         return ""
     tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+    raw_clean = re.sub(r"[^a-z0-9]", "", name.translate(tr_map).lower())
     s = name.translate(tr_map).lower()
     s = re.sub(r"\b(fc|fk|sc|sk|ac|as|cd|cf|ud|sd|afc|bk|ik|if|united|city|club|deportivo|real|sporting|al)\b", "", s)
-    s = re.sub(r"[^a-z0-9]", "", s)
-    return s.strip()
+    s = re.sub(r"[^a-z0-9]", "", s).strip()
+    return s if s else raw_clean
 
 
 class GlobalMatchDataFetcher:

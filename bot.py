@@ -30,7 +30,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from data_fetcher import GlobalMatchDataFetcher, _normalize_team_name
 from strategy_engine import MatchQuantitativeAnalyzer
@@ -88,15 +88,30 @@ class PredictionTracker:
         except Exception:
             pass
 
-    def record_picks(self, coupon_title: str, picks: List[Dict[str, Any]]) -> None:
+    def record_coupon(self, coupon_title: str, picks: List[Dict[str, Any]], total_odd: Optional[float] = None) -> None:
+        """Kuponu ve içerdiği tüm maçları tek bir kupon oturumu (coupon_id) altında kaydeder."""
+        if not picks:
+            return
         now_ts = time.time()
+        c_odd = total_odd
+        if c_odd is None:
+            c_odd = 1.0
+            for p in picks:
+                c_odd *= float(p.get("odd", 1.0))
+            c_odd = round(c_odd, 2)
+
+        matches_str = "_".join(sorted(p.get("match", "") for p in picks))
+        c_id = f"c_{abs(hash(coupon_title + matches_str)) % 1000000}"
+
         existing_ids = {r.get("id") for r in self._records}
         for p in picks:
-            p_id = f"{p['match']}__{p['pick']}"
+            p_id = f"{c_id}__{p['match']}__{p['pick']}"
             if p_id not in existing_ids:
                 self._records.append({
                     "id": p_id,
+                    "coupon_id": c_id,
                     "coupon": coupon_title,
+                    "coupon_odd": c_odd,
                     "match": p["match"],
                     "time": p.get("time", ""),
                     "pick": p["pick"],
@@ -109,8 +124,12 @@ class PredictionTracker:
                 existing_ids.add(p_id)
         self._save()
 
+    def record_picks(self, coupon_title: str, picks: List[Dict[str, Any]]) -> None:
+        """Geriye dönük uyumluluk için alias."""
+        self.record_coupon(coupon_title, picks)
+
     def update_with_results(self, finished_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        """Bitmiş maç skorlarıyla bekleyen kupon tahminlerini puanlar."""
+        """Bitmiş maç skorlarıyla bekleyen kupon tahminlerini puanlar ve hem Kupon ROE hem Tekli ROI üretir."""
         for r in self._records:
             if r["status"] != "PENDING":
                 continue
@@ -128,33 +147,83 @@ class PredictionTracker:
             )
             if fin and fin.get("home_goals") is not None and fin.get("away_goals") is not None:
                 hg, ag = fin["home_goals"], fin["away_goals"]
-                is_win = MatchQuantitativeAnalyzer.evaluate_pick(r["pick"], hg, ag)
-                r["status"] = "WON" if is_win else "LOST"
+                ht_h, ht_a = fin.get("ht_home_goals"), fin.get("ht_away_goals")
+                is_win = MatchQuantitativeAnalyzer.evaluate_pick(r["pick"], hg, ag, ht_h, ht_a)
+                if is_win is True:
+                    r["status"] = "WON"
+                elif is_win is False:
+                    r["status"] = "LOST"
+                else:
+                    # Kart, korner, ilk yarı detayı canlı skor özetinde yoksa unverified olarak işaretle (Asla yanlışlıkla LOST sayılmaz)
+                    r["status"] = "UNVERIFIED"
                 r["final_score"] = f"{hg}-{ag}"
 
         self._save()
 
-        # Karne İstatistiklerini Çıkar
-        evaluated = [r for r in self._records if r["status"] in ("WON", "LOST")]
-        won = [r for r in evaluated if r["status"] == "WON"]
-        lost = [r for r in evaluated if r["status"] == "LOST"]
-        pending = [r for r in self._records if r["status"] == "PENDING"]
+        # 1. Kupon Bazlı Gruplama & Kupon ROE (Return on Equity)
+        coupons_dict: Dict[str, Dict[str, Any]] = {}
+        for r in self._records:
+            cid = r.get("coupon_id") or r.get("coupon", "legacy")
+            if cid not in coupons_dict:
+                coupons_dict[cid] = {
+                    "id": cid,
+                    "title": r.get("coupon", "Kupon"),
+                    "odd": float(r.get("coupon_odd", 1.0)),
+                    "picks": [],
+                }
+            coupons_dict[cid]["picks"].append(r)
 
-        win_rate = (len(won) / len(evaluated) * 100) if evaluated else 0.0
+        evaluated_coupons = []
+        won_coupons = []
+        lost_coupons = []
+        pending_coupons = []
+        unverified_coupons = []
 
-        # Kasa Getirisi (ROI)
-        total_staked = len(evaluated) * 100
-        total_returned = sum(r["odd"] * 100 for r in won)
-        roi_pct = ((total_returned - total_staked) / total_staked * 100) if total_staked > 0 else 0.0
+        for cid, c in coupons_dict.items():
+            statuses = [p["status"] for p in c["picks"]]
+            if any(s == "PENDING" for s in statuses):
+                pending_coupons.append(c)
+            elif any(s == "LOST" for s in statuses):
+                lost_coupons.append(c)
+                evaluated_coupons.append(c)
+            elif all(s == "WON" for s in statuses):
+                won_coupons.append(c)
+                evaluated_coupons.append(c)
+            else:
+                unverified_coupons.append(c)
+
+        coupon_staked = len(evaluated_coupons) * 100
+        coupon_returned = sum(c["odd"] * 100 for c in won_coupons)
+        coupon_roe_pct = ((coupon_returned - coupon_staked) / coupon_staked * 100) if coupon_staked > 0 else 0.0
+        coupon_win_rate = (len(won_coupons) / len(evaluated_coupons) * 100) if evaluated_coupons else 0.0
+
+        # 2. Tekil Tercih Başarısı (Pick Win Rate & Single ROI)
+        evaluated_picks = [r for r in self._records if r["status"] in ("WON", "LOST")]
+        won_picks = [r for r in evaluated_picks if r["status"] == "WON"]
+        lost_picks = [r for r in evaluated_picks if r["status"] == "LOST"]
+        unverified_picks = [r for r in self._records if r["status"] == "UNVERIFIED"]
+        pending_picks = [r for r in self._records if r["status"] == "PENDING"]
+
+        pick_win_rate = (len(won_picks) / len(evaluated_picks) * 100) if evaluated_picks else 0.0
+        pick_staked = len(evaluated_picks) * 100
+        pick_returned = sum(r["odd"] * 100 for r in won_picks)
+        pick_roi_pct = ((pick_returned - pick_staked) / pick_staked * 100) if pick_staked > 0 else 0.0
 
         return {
-            "total_evaluated": len(evaluated),
-            "won_count": len(won),
-            "lost_count": len(lost),
-            "pending_count": len(pending),
-            "win_rate": round(win_rate, 1),
-            "roi_pct": round(roi_pct, 1),
-            "recent": evaluated[-5:],
+            "coupon_total": len(evaluated_coupons),
+            "coupon_won": len(won_coupons),
+            "coupon_lost": len(lost_coupons),
+            "coupon_pending": len(pending_coupons),
+            "coupon_win_rate": round(coupon_win_rate, 1),
+            "coupon_roe_pct": round(coupon_roe_pct, 1),
+            "pick_total": len(evaluated_picks),
+            "pick_won": len(won_picks),
+            "pick_lost": len(lost_picks),
+            "pick_unverified": len(unverified_picks),
+            "pick_pending": len(pending_picks),
+            "pick_win_rate": round(pick_win_rate, 1),
+            "pick_roi_pct": round(pick_roi_pct, 1),
+            "recent": evaluated_picks[-6:],
         }
 
 
@@ -352,13 +421,42 @@ class BettingBotFormatter:
         )
         return "\n".join(lines)
 
-    def format_upcoming_coupons(self, hours: int = 4) -> List[str]:
+    def format_upcoming_coupons(
+        self,
+        hours: int = 6,
+        tier_filter: Optional[int] = None,
+        target_odd: Optional[float] = None,
+        target_range: Optional[Tuple[float, float]] = None,
+    ) -> List[str]:
         matches = self.get_matches()
-        data = self.analyzer.build_upcoming_window_coupons(matches, hours=hours)
+        t_min, t_max = None, None
+        if target_range:
+            t_min, t_max = target_range
+        elif target_odd:
+            t_min = max(1.80, round(target_odd * 0.85, 2))
+            t_max = round(target_odd * 1.25, 2)
+
+        data = self.analyzer.build_upcoming_window_coupons(
+            matches,
+            hours=hours,
+            tier_filter=tier_filter,
+            target_min_odd=t_min,
+            target_max_odd=t_max,
+        )
         w_hours = data["window_hours"]
         start_t = data["start_time"]
         end_t = data["end_time"]
         cnt = data["match_count"]
+        tier_badge = data.get("tier_badge", "⏱️ 6 SAATLİK MAÇLAR")
+        tier_desc = data.get("tier_desc", "")
+
+        # Kuponları karnede takip etmek üzere kaydet
+        if data.get("target_coupon") and data["target_coupon"].get("picks"):
+            tc = data["target_coupon"]
+            self.tracker.record_coupon(tc.get("title", "Hedef Oran Kuponu"), tc["picks"], tc.get("total_odd"))
+        for c in data.get("coupons", []):
+            if c.get("picks"):
+                self.tracker.record_coupon(c.get("title", "Yaklaşan Kupon"), c["picks"], c.get("total_odd"))
 
         def _format_coupon_item(c: Dict[str, Any]) -> List[str]:
             lines = [f"<b>{_safe_html(c['title'])}</b>", f"<i>{_safe_html(c['desc'])}</i>"]
@@ -379,19 +477,24 @@ class BettingBotFormatter:
             lines.append("──────────────────────")
             return lines
 
-        # BÖLÜM 1: 1. Garanti ve 2. İdeal Kuponlar
+        # BÖLÜM 1: Hedef Oran (varsa) + 1. Garanti ve 2. İdeal Kuponlar
         p1_lines = [
-            f"⏱️ <b>ÖNÜMÜZDEKİ {w_hours} SAATİN KUPONLARI (BÖLÜM 1/2)</b>",
-            f"<i>🕒 Zaman Penceresi: <b>{start_t} - {end_t}</b> | Taranan Yaklaşan Maç: <b>{cnt}</b></i>",
-            "<i>Garantiden riskliye doğru anlık oynanabilir en iyi seçimler:</i>",
+            f"⏱️ <b>{tier_badge} (BÖLÜM 1/2)</b>",
+            f"<i>🕒 Zaman Penceresi: <b>{start_t} - {end_t}</b> ({w_hours} Saat) | Taranan Maç: <b>{cnt}</b></i>",
+            f"💡 <i>{tier_desc}</i>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
+
+        if data.get("target_coupon"):
+            p1_lines.append("🎯 <b>ÖZEL BELİRLENEN HEDEF ORAN KUPONUNUZ:</b>")
+            p1_lines.extend(_format_coupon_item(data["target_coupon"]))
+
         for c in data["coupons"][:2]:
             p1_lines.extend(_format_coupon_item(c))
 
         # BÖLÜM 2: 3. Değer & Fırsat ve 4. Sürpriz Vurgun Kuponları
         p2_lines = [
-            f"⏱️ <b>ÖNÜMÜZDEKİ {w_hours} SAATİN KUPONLARI (BÖLÜM 2/2)</b>",
+            f"⏱️ <b>{tier_badge} (BÖLÜM 2/2)</b>",
             "<i>(Orta Riskli Değer &amp; Yüksek Oranlı Sürpriz Vurgun Kuponları)</i>",
             "━━━━━━━━━━━━━━━━━━━━━━",
         ]
@@ -399,7 +502,9 @@ class BettingBotFormatter:
             p2_lines.extend(_format_coupon_item(c))
 
         p2_lines.append(
-            "💡 <i>Günün tüm bültenini kapsayan 5 kademeli kuponlar için <b>/kupon</b> butonunu kullanabilirsiniz.</i>"
+            "💡 <b>Kişiselleştirme İpuçları:</b>\n"
+            "• Hedef oran belirlemek için: <code>/oran 4.5</code> veya <code>/6saat oran=3-6</code> yazabilirsiniz.\n"
+            "• Lig filtrelemek için: <code>/lig1</code>, <code>/lig2</code>, <code>/lig3</code> veya <code>/karisik</code> yazabilirsiniz."
         )
 
         return ["\n".join(p1_lines), "\n".join(p2_lines)]
@@ -410,29 +515,49 @@ class BettingBotFormatter:
         fin_map = scores_data.get("finished", {})
         stats = self.tracker.update_with_results(fin_map)
 
-        total_ev = stats["total_evaluated"]
-        won_cnt = stats["won_count"]
-        lost_cnt = stats["lost_count"]
-        pending_cnt = stats["pending_count"]
-        win_rate = stats["win_rate"]
-        roi = stats["roi_pct"]
+        c_tot = stats["coupon_total"]
+        c_won = stats["coupon_won"]
+        c_lost = stats["coupon_lost"]
+        c_pend = stats["coupon_pending"]
+        c_win_rate = stats["coupon_win_rate"]
+        c_roe = stats["coupon_roe_pct"]
+
+        p_tot = stats["pick_total"]
+        p_won = stats["pick_won"]
+        p_lost = stats["pick_lost"]
+        p_unv = stats["pick_unverified"]
+        p_pend = stats["pick_pending"]
+        p_win_rate = stats["pick_win_rate"]
+        p_roi = stats["pick_roi_pct"]
 
         lines = [
             "📊 <b>BOT TAHMİN & KUPON BAŞARI KARNESİ (TRACK RECORD)</b>",
-            "<i>Modelin önerdiği tüm kupon ve maçlar otomatik takip edilir, maç sonu skorlarıyla doğrulanır:</i>",
+            "<i>Modelin önerdiği kuponlar ve tercihler resmi maç sonu skorlarıyla doğrulanır:</i>",
             "━━━━━━━━━━━━━━━━━━━━━━",
-            f"📈 <b>Toplam Değerlendirilen Tercih:</b> {total_ev} Maç",
-            f"✅ <b>Tutan Tahminler:</b> {won_cnt} Maç",
-            f"❌ <b>Yatan Tahminler:</b> {lost_cnt} Maç",
-            f"🎯 <b>Genel İsabet Oranı:</b> %{win_rate:.1f}",
-            f"💰 <b>Net Kasa Getirisi (ROI):</b> %{roi:+.1f}",
-            f"⏳ <b>Devam Eden / Sonuç Bekleyen:</b> {pending_cnt} Maç",
+            "🎫 <b>1. KUPON BAZLI GETİRİ & ROE (Kombine Başarısı):</b>",
+            f"  • <b>Değerlendirilen Tam Kupon:</b> {c_tot} Kupon",
+            f"  • ✅ <b>Tutan Kuponlar:</b> {c_won} Adet",
+            f"  • ❌ <b>Yatan Kuponlar:</b> {c_lost} Adet",
+            f"  • 🎯 <b>Kupon Başarı Oranı:</b> %{c_win_rate:.1f}",
+            f"  • 📈 <b>Net Kupon ROE (Kasa Büyümesi):</b> %{c_roe:+.1f}",
+            f"  • ⏳ <b>Devam Eden / Sonuç Bekleyen:</b> {c_pend} Kupon",
+            "  💡 <i>(Hesaplama: Her kupona 100 TL eşit sabit kasa bahsi baz alınmıştır.)</i>",
+            "──────────────────────",
+            "🎯 <b>2. TEKİL TERCİH İSABETİ & FLAT ROI (Single Bet Başarısı):</b>",
+            f"  • <b>Sonuçlanan Net Tercih:</b> {p_tot} Maç",
+            f"  • ✅ <b>Kazanan Seçimler:</b> {p_won} Maç",
+            f"  • ❌ <b>Kaybeden Seçimler:</b> {p_lost} Maç",
+            f"  • 🎯 <b>Tekil İsabet Oranı:</b> %{p_win_rate:.1f}",
+            f"  • 💰 <b>Tekli Kasa Getirisi (ROI):</b> %{p_roi:+.1f}",
+            f"  • ⏳ <b>Devam Eden Maçlar:</b> {p_pend} Maç",
+            f"  • ⚖️ <b>Unverified (İstatistiksiz):</b> {p_unv} Maç",
+            "  💡 <i>(Mackolik skorunda korner/kart istatistiği bulunmadığında yanıltıcı 'yattı' yazılmaması için istatistik dışı tutulur.)</i>",
             "──────────────────────",
         ]
 
         recent = stats.get("recent", [])
         if recent:
-            lines.append("🏁 <b>Sonuçlanan Son Maçlar:</b>")
+            lines.append("🏁 <b>Sonuçlanan Son Tercihler:</b>")
             for r in recent[-6:]:
                 emoji = "✅" if r["status"] == "WON" else "❌"
                 sc = r.get("final_score") or "-"
@@ -441,7 +566,6 @@ class BettingBotFormatter:
         else:
             lines.append("💡 <i>Henüz sonuçlanmış kayıtlı maç yok. Yeni kuponlar oluştukça maçlar bittikçe karne otomatik güncellenir.</i>\n──────────────────────")
 
-        lines.append("📌 <i>Not: ROI hesabı her maça eşit 100 birim sabit kasa bahsi (flat betting) baz alınarak yapılmıştır.</i>")
         return "\n".join(lines)
 
     def format_dropping_odds(self) -> str:
@@ -801,7 +925,16 @@ class TelegramBettingBot:
             {"text": "📢 Günlük VIP Bülten", "callback_data": "action:vip_broadcast"},
         ],
         [
-            {"text": "⏱️ Önümüzdeki 4 Saat Kuponları", "callback_data": "action:upcoming_4h"},
+            {"text": "⏱️ 6 Saat: Lig 1 (Ana Ligler)", "callback_data": "action:upcoming_tier1"},
+            {"text": "⏱️ 6 Saat: Lig 2 (2. Ligler)", "callback_data": "action:upcoming_tier2"},
+        ],
+        [
+            {"text": "⏱️ 6 Saat: Lig 3 (Alt Ligler)", "callback_data": "action:upcoming_tier3"},
+            {"text": "⏱️ 6 Saat: Karışık (Tümü)", "callback_data": "action:upcoming_all"},
+        ],
+        [
+            {"text": "🎯 6 Saat: Hedef Oran 3-5", "callback_data": "action:uptarget:3_5"},
+            {"text": "🎯 6 Saat: Hedef Oran 5-10", "callback_data": "action:uptarget:5_10"},
         ],
         [
             {"text": "🎫 5 Kademeli Kuponlar (Garanti ➔ Bomba)", "callback_data": "action:coupons"},
@@ -965,7 +1098,11 @@ class TelegramBettingBot:
                 "• <code>/tansiyon</code> — 🟨 Hakem & Maç Tansiyon Radarı (Kart & Korner)\n"
                 "• <code>/simulasyon &lt;takım&gt;</code> — 🎲 Monte Carlo 10.000 Simülasyon\n"
                 "• <code>/yayinla</code> — 📢 Günlük VIP Bülteni Kanala/Sohbete Yayınla\n"
-                "• <code>/4saat</code> — ⏱️ Önümüzdeki 4 Saatin Maçları (Garantiden Riskliye)\n"
+                "• <code>/lig1</code> — 👑 6 Saatlik Lig 1 (Ana Ligler & Nesine 1)\n"
+                "• <code>/lig2</code> — 🥈 6 Saatlik Lig 2 (2. Ligler & Kaliteli Ligler)\n"
+                "• <code>/lig3</code> — 🥉 6 Saatlik Lig 3 (Alt Ligler & Diğerleri)\n"
+                "• <code>/karisik</code> — 🎲 6 Saatlik Karışık (Tüm Ligler)\n"
+                "• <code>/6saat</code> — ⏱️ Önümüzdeki 6 Saatin Maçları (Garantiden Riskliye)\n"
                 "• <code>/kupon</code> — 🎫 5 Kademeli Günlük Kupon (Garanti ➔ Bomba)\n"
                 "• <code>/sistem</code> — 🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)\n"
                 "• <code>/kasa &lt;tutar&gt;</code> — 💰 Akıllı Kasa Dağıtım Planı (Örn: <code>/kasa 1000</code>)\n"
@@ -1075,8 +1212,66 @@ class TelegramBettingBot:
                 show_menu=True,
             )
 
-        elif cmd in ("/4saat", "/yaklasan"):
-            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=4), show_menu=True)
+        elif cmd in ("/6saat", "/4saat", "/yaklasan", "/lig1", "/lig2", "/lig3", "/karisik", "/hepsi", "/oran", "/hedef"):
+            target_odd, target_range = None, None
+            tier_filter = 1  # Varsayılan: Lig 1 (Ana ve Elit Ligler)
+            arg_lower = arg.strip().lower()
+
+            if cmd in ("/lig1", "/tier1"):
+                tier_filter = 1
+            elif cmd in ("/lig2", "/tier2"):
+                tier_filter = 2
+            elif cmd in ("/lig3", "/tier3"):
+                tier_filter = 3
+            elif cmd in ("/karisik", "/hepsi"):
+                tier_filter = None
+            elif "lig2" in arg_lower or "lig 2" in arg_lower or arg_lower == "2":
+                tier_filter = 2
+            elif "lig3" in arg_lower or "lig 3" in arg_lower or arg_lower == "3":
+                tier_filter = 3
+            elif "karisik" in arg_lower or "hepsi" in arg_lower or "tum" in arg_lower:
+                tier_filter = None
+
+            # Oran parametrelerini akıllı ayrıştır (örn: /oran 4.5, /oran 3-6, /6saat oran=5, /lig1 4.0)
+            for token in arg.split():
+                tl = token.lower()
+                if tl.startswith("oran="):
+                    val = tl.replace("oran=", "")
+                    if "-" in val:
+                        parts = val.split("-")
+                        try:
+                            target_range = (float(parts[0]), float(parts[1]))
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            target_odd = float(val)
+                        except ValueError:
+                            pass
+                elif "-" in tl and re.match(r"^\d+(\.\d+)?-\d+(\.\d+)?$", tl):
+                    parts = tl.split("-")
+                    try:
+                        target_range = (float(parts[0]), float(parts[1]))
+                    except ValueError:
+                        pass
+                elif re.match(r"^\d+(\.\d+)?$", tl):
+                    try:
+                        v = float(tl)
+                        if v >= 1.2:
+                            target_odd = v
+                    except ValueError:
+                        pass
+
+            self.send_message(
+                chat_id,
+                self.formatter.format_upcoming_coupons(
+                    hours=6,
+                    tier_filter=tier_filter,
+                    target_odd=target_odd,
+                    target_range=target_range,
+                ),
+                show_menu=True,
+            )
 
         elif cmd == "/kupon":
             self.send_message(chat_id, self.formatter.format_coupons(), show_menu=True)
@@ -1160,7 +1355,11 @@ class TelegramBettingBot:
             {"command": "simulasyon", "description": "🎲 Monte Carlo 10.000 Simülasyon"},
             {"command": "yayinla", "description": "📢 Günlük VIP Bülteni Kanala/Sohbete Yayınla"},
             {"command": "kanal", "description": "📡 VIP Yayın Kanalı Belirle (/kanal @KanalAdi)"},
-            {"command": "4saat", "description": "⏱️ Önümüzdeki 4 Saatin Kuponları (Garantiden Riskliye)"},
+            {"command": "lig1", "description": "👑 6 Saatlik Lig 1 (Ana Ligler & Nesine 1)"},
+            {"command": "lig2", "description": "🥈 6 Saatlik Lig 2 (2. Ligler & Kaliteli Ligler)"},
+            {"command": "lig3", "description": "🥉 6 Saatlik Lig 3 (Alt Ligler & Diğerleri)"},
+            {"command": "karisik", "description": "🎲 6 Saatlik Karışık (Tüm Ligler)"},
+            {"command": "6saat", "description": "⏱️ Önümüzdeki 6 Saatin Kuponları"},
             {"command": "kupon", "description": "🎫 5 Kademeli Günlük Kuponlar (Garanti ➔ Bomba)"},
             {"command": "sistem", "description": "🎰 2 Absürt Oran Sistem Kuponu (8 & 10 Maç)"},
             {"command": "kasa", "description": "💰 Akıllı Kasa Dağıtım Planı (Örn: /kasa 1000)"},
@@ -1279,8 +1478,26 @@ class TelegramBettingBot:
                             self.send_message(chat_id, self.formatter.format_monte_carlo(), show_menu=True)
                         elif data == "action:vip_broadcast":
                             self.handle_command(chat_id, "/yayinla")
-                        elif data == "action:upcoming_4h":
-                            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=4), show_menu=True)
+                        elif data == "action:upcoming_tier1":
+                            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=6, tier_filter=1), show_menu=True)
+                        elif data == "action:upcoming_tier2":
+                            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=6, tier_filter=2), show_menu=True)
+                        elif data == "action:upcoming_tier3":
+                            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=6, tier_filter=3), show_menu=True)
+                        elif data in ("action:upcoming_all", "action:upcoming_4h"):
+                            self.send_message(chat_id, self.formatter.format_upcoming_coupons(hours=6, tier_filter=None), show_menu=True)
+                        elif data.startswith("action:uptarget:"):
+                            rng = data.replace("action:uptarget:", "")
+                            p_rng = rng.split("_")
+                            try:
+                                r_min, r_max = float(p_rng[0]), float(p_rng[1])
+                                self.send_message(
+                                    chat_id,
+                                    self.formatter.format_upcoming_coupons(hours=6, tier_filter=1, target_range=(r_min, r_max)),
+                                    show_menu=True,
+                                )
+                            except Exception:
+                                pass
                         elif data == "action:coupons":
                             self.send_message(chat_id, self.formatter.format_coupons(), show_menu=True)
                         elif data == "action:system":

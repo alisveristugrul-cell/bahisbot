@@ -982,74 +982,114 @@ class MatchQuantitativeAnalyzer:
         """
         all_analyzed = [self.analyze_match(m) for m in matches]
 
-        def _get_best_signal(analyzed_item: Dict[str, Any], allowed_keys: List[str]) -> Optional[Dict[str, Any]]:
-            best = None
-            for k in allowed_keys:
-                s = analyzed_item["signals"].get(k)
-                if s and (best is None or s["confidence"] > best["confidence"]):
-                    best = s
-            return best
-
         used_codes: Set[str] = set()
 
-        def _select_pool(allowed_keys: List[str], min_odd: float, max_odd: float, min_conf: float, limit: int) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-            pool = []
+        def _select_diverse_pool(
+            allowed_keys: List[str],
+            min_odd: float,
+            max_odd: float,
+            min_conf: float,
+            limit: int,
+            max_per_family: int = 1,
+        ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+            # Adayları topla (maçın sunduğu her geçerli sinyal için)
+            candidates = []
             for a in all_analyzed:
                 code = a["match"]["code"]
                 if code in used_codes:
                     continue
-                s = _get_best_signal(a, allowed_keys)
-                if s and min_odd <= s["odd"] <= max_odd and s["confidence"] >= min_conf:
-                    pool.append((a, s))
-            pool.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
-            chosen = pool[:limit]
+                for k in allowed_keys:
+                    s = a["signals"].get(k)
+                    if s and min_odd <= s["odd"] <= max_odd and s.get("confidence", 0) >= min_conf:
+                        fam = self.get_market_family(k, s.get("pick", ""))
+                        if fam == "specials" and "kart_korner" not in allowed_keys and "korner" not in allowed_keys:
+                            continue
+                        candidates.append((a, s, fam))
+
+            # Güven skoruna göre sırala
+            candidates.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
+
+            chosen: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+            chosen_codes: Set[str] = set()
+            family_counts: Dict[str, int] = {}
+
+            # 1. Aşama: Her pazar ailesinden en fazla max_per_family adet al (çeşitlilik garantisi)
+            for a, s, fam in candidates:
+                if len(chosen) >= limit:
+                    break
+                code = a["match"]["code"]
+                if code in chosen_codes:
+                    continue
+                if family_counts.get(fam, 0) < max_per_family:
+                    chosen.append((a, s))
+                    chosen_codes.add(code)
+                    family_counts[fam] = family_counts.get(fam, 0) + 1
+
+            # 2. Aşama: Yeterli maç bulunamadıysa kuralı 1 adım gevşet
+            if len(chosen) < limit:
+                for a, s, fam in candidates:
+                    if len(chosen) >= limit:
+                        break
+                    code = a["match"]["code"]
+                    if code in chosen_codes:
+                        continue
+                    if family_counts.get(fam, 0) < (max_per_family + 1):
+                        chosen.append((a, s))
+                        chosen_codes.add(code)
+                        family_counts[fam] = family_counts.get(fam, 0) + 1
+
             for a, _ in chosen:
                 used_codes.add(a["match"]["code"])
             return chosen
 
         # 1. 🟢 Kasa Katlayıcı Garanti Kupon (Düşük Risk, 3 Maç, Oran ~2.00 - 3.20)
-        garanti_picks = _select_pool(
-            allowed_keys=["ms_banko", "ust_25", "alt_taktigi", "kg_var"],
+        garanti_picks = _select_diverse_pool(
+            allowed_keys=["ms_banko", "ust_25", "alt_taktigi", "kg_var", "takim_iki_yari_gol"],
             min_odd=1.28,
             max_odd=1.65,
             min_conf=65.0,
             limit=3,
+            max_per_family=1,
         )
 
         # 2. 🔵 İdeal Dengeli Karma Kupon (Orta-Düşük Risk, 4 Maç, Oran ~4.50 - 7.50)
-        ideal_picks = _select_pool(
-            allowed_keys=["kg_var", "ust_25", "tg_aralik", "alt_taktigi", "korner", "takim_iki_yari_gol"],
+        ideal_picks = _select_diverse_pool(
+            allowed_keys=["kg_var", "ust_25", "tg_aralik", "alt_taktigi", "takim_iki_yari_gol", "kombo", "iy_ust"],
             min_odd=1.45,
             max_odd=1.95,
             min_conf=62.0,
             limit=4,
+            max_per_family=1,
         )
 
         # 3. 🟡 Değer / Value Taktik Kuponu (Orta Risk, 4 Maç, Oran ~9.00 - 18.00)
-        value_picks = _select_pool(
+        value_picks = _select_diverse_pool(
             allowed_keys=["value_bet", "kombo", "takim_iki_yari_gol", "iy_ust", "ust_25", "kg_var"],
             min_odd=1.60,
             max_odd=2.45,
             min_conf=58.0,
             limit=4,
+            max_per_family=1,
         )
 
         # 4. 🟠 Yüksek Oranlı Sert Karma Kupon (Yüksek Risk, 4-5 Maç, Oran ~25.00 - 60.00)
-        agresif_picks = _select_pool(
-            allowed_keys=["iy_ust", "ust_35", "tg_aralik", "iyms_surpriz", "kombo", "kart_korner"],
+        agresif_picks = _select_diverse_pool(
+            allowed_keys=["iy_ust", "ust_35", "tg_aralik", "iyms_surpriz", "kombo", "takim_iki_yari_gol"],
             min_odd=1.90,
             max_odd=3.80,
             min_conf=54.0,
             limit=4,
+            max_per_family=1,
         )
 
         # 5. 🔴 Bomba Sürpriz Vurgun Kuponu (Çok Yüksek Risk, 4 Maç, Oran ~70.00 - 250.00+)
-        bomba_picks = _select_pool(
+        bomba_picks = _select_diverse_pool(
             allowed_keys=["arti_6_gol", "iki_yari_kg", "iyms_surpriz", "kesin_skor", "ust_35"],
             min_odd=2.40,
             max_odd=12.00,
             min_conf=50.0,
             limit=4,
+            max_per_family=1,
         )
 
         # 6. 🎰 SİSTEM PAKETİ 1 (8 Maçta Sistem 4-5-6 "Kaos & Geri Dönüş")
@@ -1154,46 +1194,264 @@ class MatchQuantitativeAnalyzer:
             },
         }
 
-    def build_upcoming_window_coupons(self, matches: List[Dict[str, Any]], hours: int = 4) -> Dict[str, Any]:
+    @staticmethod
+    def classify_match_league_tier(match: Dict[str, Any]) -> int:
         """
-        Önümüzdeki 4 saat içinde başlayacak maçları filtreleyerek
+        Maçın ligini güvenilirlik ve önem derecesine göre 3 seviyeye (Tier) ayırır:
+        Tier 1: Ana / Elit Ligler (Nesine'de '1' / MBS 1 yazanlar, Süper Lig, Premier Lig, La Liga, Serie A, vb.)
+        Tier 2: 2. Ligler & Kaliteli İkincil Ligler (Championship, La Liga 2, 2. Bundesliga, TFF 1. Lig, vb.)
+        Tier 3: 3. Ligler, Alt Ligler, Gençler/U19, Amatör ve Rezerv Ligler
+        """
+        l = match.get("league", "").lower()
+        mbs = match.get("mbs", 3)
+
+        # Kesin Alt Lig / Gençlik / Amatör Filtresi -> Tier 3
+        exclude_sub = [
+            "u19", "u20", "u21", "u23", "genç", "kadın", "reserve", "rezerv",
+            "3. lig", "3.lig", "4. lig", "4.lig", "federasyon", "amatör",
+            "bölgesel", "regional", "oberliga", "segunda rfef", "tercera"
+        ]
+        if any(x in l for x in exclude_sub):
+            return 3
+
+        # Tier 1 - Ana / Elit Ligler & Büyük Organizasyonlar & Nesine MBS 1
+        tier1_leagues = [
+            "süper lig", "super lig", "premier lig", "premier league", "la liga",
+            "serie a", "bundesliga", "ligue 1", "şampiyonlar ligi", "avrupa ligi",
+            "konferans ligi", "uluslar ligi", "eredivisie", "liga portugal", "primeira liga",
+            "suudi arabistan pro", "suudi pro", "brezilya serie a", "arjantin primera lpf",
+            "abd major lig", "mls"
+        ]
+        if any(k in l for k in tier1_leagues) and not any(x in l for x in ["2.", "3.", "kadın"]):
+            return 1
+
+        # Nesine'de yanında "1" yazan (MBS 1) ana ligler
+        if mbs == 1 and not any(x in l for x in ["2.", "3.", "kadın", "genç", "rfef"]):
+            return 1
+
+        # Tier 2 - Güçlü 2. Ligler ve Kaliteli Ligler
+        tier2_leagues = [
+            "championship", "2. lig", "segunda", "2. bundesliga", "serie b",
+            "ligue 2", "1. lig", "tff 1", "allsvenskan", "superliga", "eliteserien",
+            "ekstraklasa", "premiership", "belçika", "avusturya bundesliga",
+            "isviçre süper", "isveç allsvenskan", "danimarka süper", "yunanistan süper",
+            "brezilya serie b", "primera nacional", "liga mx", "j1"
+        ]
+        if any(k in l for k in tier2_leagues):
+            return 2
+        if any(x in l for x in ["süper lig", "premier lig", "1. lig", "pro lig"]):
+            return 2
+
+        return 3
+
+    def build_custom_target_odds_coupon(
+        self,
+        matches: List[Dict[str, Any]],
+        target_min_odd: float,
+        target_max_odd: float,
+        tier_filter: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Kullanıcının belirlediği hedef oran aralığına (örn. 3.00 - 6.00)
+        en uygun, matematiksel olasılığı ve piyasa değeri en yüksek,
+        pazar ailesi çeşitlendirilmiş özel kupon oluşturur.
+        """
+        if tier_filter in (1, 2, 3):
+            matches = [m for m in matches if self.classify_match_league_tier(m) == tier_filter]
+
+        all_analyzed = [self.analyze_match(m) for m in matches if m.get("odds")]
+        all_analyzed = [a for a in all_analyzed if a["signals"]]
+
+        if not all_analyzed:
+            return None
+
+        target_mid = (target_min_odd + target_max_odd) / 2.0
+
+        # Her maç için farklı market ailelerinden geçerli sinyalleri topla
+        match_candidates: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
+        for a in all_analyzed:
+            fams_for_m: Dict[str, Dict[str, Any]] = {}
+            for k, s in a["signals"].items():
+                if not (1.20 <= s["odd"] <= 4.80) or s.get("confidence", 0) < 50.0:
+                    continue
+                fam = self.get_market_family(k, s.get("pick", ""))
+                if fam not in fams_for_m or s["confidence"] > fams_for_m[fam]["confidence"]:
+                    fams_for_m[fam] = s
+            for fam, s in fams_for_m.items():
+                match_candidates.append((a, s, fam))
+
+        if not match_candidates:
+            return None
+
+        # Güvene göre sırala ve en iyi 25 adayı değerlendir
+        match_candidates.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
+        top_cands = match_candidates[:25]
+
+        best_combo = None
+        best_score = -999999.0
+
+        import itertools
+        for k in (2, 3, 4):
+            for combo in itertools.combinations(top_cands, k):
+                codes = [item[0]["match"]["code"] for item in combo]
+                if len(set(codes)) != len(codes):
+                    continue
+                fams = [item[2] for item in combo]
+                fam_diversity = len(set(fams))
+                if fam_diversity < len(fams) - 1:
+                    continue
+
+                tot_odd = 1.0
+                for item in combo:
+                    tot_odd *= item[1]["odd"]
+
+                if tot_odd < target_min_odd * 0.70 or tot_odd > target_max_odd * 1.40:
+                    continue
+
+                avg_conf = sum(item[1]["confidence"] for item in combo) / k
+                in_range = 1.0 if (target_min_odd <= tot_odd <= target_max_odd) else 0.0
+                dist = abs(tot_odd - target_mid) / max(0.1, target_mid)
+
+                score = (avg_conf * 1.2) + (in_range * 45.0) + (fam_diversity * 8.0) - (dist * 35.0)
+                if score > best_score:
+                    best_score = score
+                    best_combo = (combo, tot_odd)
+
+        if not best_combo:
+            fallback_c = top_cands[:3]
+            tot_odd = 1.0
+            for item in fallback_c:
+                tot_odd *= item[1]["odd"]
+            best_combo = (fallback_c, tot_odd)
+
+        combo_items, tot_odd = best_combo
+        picks = []
+        for a, s, fam in combo_items:
+            picks.append({
+                "match": f"{a['match']['home']} - {a['match']['away']}",
+                "league": a["match"]["league"],
+                "time": f"{a['match']['date']} {a['match']['time']}",
+                "pick": s["pick"],
+                "odd": s["odd"],
+                "prob": s["prob"],
+                "confidence": s.get("confidence", 0.0),
+                "family": fam,
+                "reason": s["reasons"][0] if s["reasons"] else "",
+            })
+
+        return {
+            "title": f"🎯 6 SAATLİK ÖZEL HEDEF ORAN KUPONU (Hedef: {target_min_odd:.2f} - {target_max_odd:.2f})",
+            "desc": f"Belirlediğiniz {target_min_odd:.2f} - {target_max_odd:.2f} oran aralığına uygun, market ailesi çeşitlendirilmiş optimal kupon.",
+            "risk_badge": "Özel Hedef Oran",
+            "target_min_odd": target_min_odd,
+            "target_max_odd": target_max_odd,
+            "total_odd": round(tot_odd, 2),
+            "picks": picks,
+        }
+
+    def build_upcoming_window_coupons(
+        self,
+        matches: List[Dict[str, Any]],
+        hours: int = 6,
+        tier_filter: Optional[int] = None,
+        target_min_odd: Optional[float] = None,
+        target_max_odd: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Önümüzdeki 6 saat içinde başlayacak maçları filtreleyerek
+        seçilen lig kategorisine (Lig 1, Lig 2, Lig 3 veya Karışık) göre
         Garantiden Riskliye Doğru 4 Kademeli Yaklaşan Maç Kuponu üretir.
+        İstenirse kullanıcının belirlediği özel hedef oran kuponunu da ekler.
         """
         from datetime import datetime, timedelta
         now = datetime.now()
         limit = now + timedelta(hours=hours)
 
-        # 4 saatlik penceredeki maçları al
-        window_matches = [m for m in matches if now <= m.get("start_dt", now) <= limit]
+        # 6 saatlik penceredeki maçları al
+        time_matches = [m for m in matches if now <= m.get("start_dt", now) <= limit]
         actual_hours = hours
-        if len(window_matches) < 6:
-            # Gece veya sakin saatlerde maç az ise pencereyi otomatik genişlet
-            actual_hours = 8
+        if len(time_matches) < 4:
+            actual_hours = max(hours, 8)
             limit = now + timedelta(hours=actual_hours)
-            window_matches = [m for m in matches if now <= m.get("start_dt", now) <= limit]
+            time_matches = [m for m in matches if now <= m.get("start_dt", now) <= limit]
+
+        tier_label_map = {
+            1: "👑 LİG 1 (ANA VE ELİT LİGLER / NESİNE 1)",
+            2: "🥈 LİG 2 (2. LİGLER & KALİTELİ LİGLER)",
+            3: "🥉 LİG 3 (ALT LİGLER & DİĞERLERİ)",
+        }
+        tier_desc_map = {
+            1: "Sadece Süper Lig, Premier Lig, La Liga, Serie A gibi büyük ve güvenilir ana ligler taranır (3. lig ve alt ligler elenmiştir).",
+            2: "Championship, Segunda, 2. Bundesliga, TFF 1. Lig gibi kaliteli ikincil ligler taranır.",
+            3: "3. Ligler, yerel ve bölgesel alt ligler taranır.",
+        }
+
+        if tier_filter in (1, 2, 3):
+            window_matches = [m for m in time_matches if self.classify_match_league_tier(m) == tier_filter]
+            tier_badge = tier_label_map[tier_filter]
+            tier_desc = tier_desc_map[tier_filter]
+            has_enough = len(window_matches) >= 3
+        else:
+            window_matches = time_matches
+            tier_badge = "🎲 6 SAATLİK KARIŞIK (TÜM LİGLER)"
+            tier_desc = "Bültendeki tüm ligler arasından modelin en yüksek güven verdiği karma kuponlar."
+            has_enough = len(window_matches) >= 3
 
         all_analyzed = [self.analyze_match(m) for m in window_matches]
         all_analyzed = [a for a in all_analyzed if a["signals"]]
 
-        def _get_best_signal(analyzed_item: Dict[str, Any], allowed_keys: List[str]) -> Optional[Dict[str, Any]]:
-            best = None
-            for k in allowed_keys:
-                s = analyzed_item["signals"].get(k)
-                if s and (best is None or s["confidence"] > best["confidence"]):
-                    best = s
-            return best
-
-        def _select_pool(allowed_keys: List[str], min_odd: float, max_odd: float, limit: int, exclude_codes: Optional[Set[str]] = None) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-            pool = []
+        def _select_diverse_window_pool(
+            allowed_keys: List[str],
+            min_odd: float,
+            max_odd: float,
+            limit: int,
+            exclude_codes: Optional[Set[str]] = None,
+            max_per_family: int = 1,
+        ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+            candidates = []
             for a in all_analyzed:
                 code = a["match"]["code"]
                 if exclude_codes is not None and code in exclude_codes:
                     continue
-                s = _get_best_signal(a, allowed_keys)
-                if s and min_odd <= s["odd"] <= max_odd:
-                    pool.append((a, s))
-            pool.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
-            chosen = pool[:limit]
+                for k in allowed_keys:
+                    s = a["signals"].get(k)
+                    if s and min_odd <= s["odd"] <= max_odd:
+                        fam = self.get_market_family(k, s.get("pick", ""))
+                        if fam == "specials" and "kart_korner" not in allowed_keys and "korner" not in allowed_keys:
+                            continue
+                        candidates.append((a, s, fam))
+
+            candidates.sort(key=lambda x: (x[1]["confidence"], x[1]["prob"]), reverse=True)
+
+            chosen: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+            chosen_codes: Set[str] = set()
+            family_counts: Dict[str, int] = {}
+
+            # 1. Aşama: max_per_family kuralına uyarak farklı pazarlardan seç
+            for a, s, fam in candidates:
+                if len(chosen) >= limit:
+                    break
+                code = a["match"]["code"]
+                if code in chosen_codes:
+                    continue
+                if family_counts.get(fam, 0) < max_per_family:
+                    chosen.append((a, s))
+                    chosen_codes.add(code)
+                    family_counts[fam] = family_counts.get(fam, 0) + 1
+
+            # 2. Aşama: Limit dolmadıysa esnet
+            if len(chosen) < limit:
+                for a, s, fam in candidates:
+                    if len(chosen) >= limit:
+                        break
+                    code = a["match"]["code"]
+                    if code in chosen_codes:
+                        continue
+                    if family_counts.get(fam, 0) < (max_per_family + 1):
+                        chosen.append((a, s))
+                        chosen_codes.add(code)
+                        family_counts[fam] = family_counts.get(fam, 0) + 1
+
             if exclude_codes is not None:
                 for a, _ in chosen:
                     exclude_codes.add(a["match"]["code"])
@@ -1224,57 +1482,76 @@ class MatchQuantitativeAnalyzer:
 
         used_codes: Set[str] = set()
 
-        # 1. 🟢 4 Saatlik Kasa Katlayıcı (Garanti / Düşük Risk, 2-3 Maç)
-        garanti = _select_pool(
+        # 1. 🟢 6 Saatlik Kasa Katlayıcı (Garanti / Düşük Risk, 2-3 Maç)
+        garanti = _select_diverse_window_pool(
             allowed_keys=["ms_banko", "ust_25", "alt_taktigi", "kg_var", "takim_iki_yari_gol"],
             min_odd=1.25,
             max_odd=1.65,
             limit=3,
             exclude_codes=used_codes,
+            max_per_family=1,
         )
 
-        # 2. 🔵 4 Saatlik İdeal Kombine (Dengeli / Orta-Düşük Risk, 3 Maç)
-        ideal = _select_pool(
-            allowed_keys=["kg_var", "ust_25", "tg_aralik", "korner", "takim_iki_yari_gol", "kombo"],
+        # 2. 🔵 6 Saatlik İdeal Kombine (Dengeli / Orta-Düşük Risk, 3 Maç)
+        ideal = _select_diverse_window_pool(
+            allowed_keys=["kg_var", "ust_25", "tg_aralik", "takim_iki_yari_gol", "kombo", "iy_ust"],
             min_odd=1.45,
             max_odd=1.95,
             limit=3,
             exclude_codes=used_codes,
+            max_per_family=1,
         )
 
-        # 3. 🟡 4 Saatlik Değer & Fırsat (Orta Risk, 3 Maç)
-        value = _select_pool(
-            allowed_keys=["value_bet", "kombo", "iy_ust", "ust_35"],
+        # 3. 🟡 6 Saatlik Değer & Fırsat (Orta Risk, 3 Maç)
+        value = _select_diverse_window_pool(
+            allowed_keys=["value_bet", "kombo", "iy_ust", "ust_35", "takim_iki_yari_gol"],
             min_odd=1.60,
             max_odd=2.50,
             limit=3,
             exclude_codes=used_codes,
+            max_per_family=1,
         )
 
-        # 4. 🔴 4 Saatlik Sürpriz Vurgun (Yüksek Risk, 2-3 Maç)
-        surpriz = _select_pool(
+        # 4. 🔴 6 Saatlik Sürpriz Vurgun (Yüksek Risk, 2-3 Maç)
+        surpriz = _select_diverse_window_pool(
             allowed_keys=["arti_6_gol", "iyms_surpriz", "kesin_skor", "ust_35", "iki_yari_kg"],
             min_odd=2.00,
             max_odd=15.00,
             limit=3,
             exclude_codes=None,
+            max_per_family=1,
         )
+
+        # Özel hedef oran kuponu talebi varsa oluştur
+        target_coupon = None
+        if target_min_odd is not None and target_max_odd is not None:
+            target_coupon = self.build_custom_target_odds_coupon(
+                window_matches,
+                target_min_odd=target_min_odd,
+                target_max_odd=target_max_odd,
+                tier_filter=tier_filter,
+            )
 
         return {
             "window_hours": actual_hours,
+            "tier_filter": tier_filter,
+            "tier_badge": tier_badge,
+            "tier_desc": tier_desc,
+            "has_enough": has_enough,
             "start_time": now.strftime("%H:%M"),
             "end_time": limit.strftime("%H:%M"),
             "match_count": len(window_matches),
+            "target_coupon": target_coupon,
             "coupons": [
                 _pack_coupon(
                     "🟢 1. YAKLAŞAN GARANTİ KUPON (Düşük Risk)",
-                    "Önümüzdeki saatlerin en yüksek güvenli banko tercihleri.",
+                    "Önümüzdeki saatlerin en yüksek güvenli banko tercihleri (Çeşitlendirilmiş Pazar).",
                     "Düşük Risk",
                     garanti,
                 ),
                 _pack_coupon(
                     "🔵 2. YAKLAŞAN İDEAL KOMBİNE (Dengeli Risk)",
-                    "Dengeli oran ve yüksek olasılıklı karma tercihler.",
+                    "Dengeli oran ve yüksek olasılıklı karma tercihler (KG, İki Yarı Gol, 2.5 Üst).",
                     "Dengeli",
                     ideal,
                 ),
@@ -1467,41 +1744,185 @@ class MatchQuantitativeAnalyzer:
         }
 
     @staticmethod
-    def evaluate_pick(pick: str, home_score: int, away_score: int) -> bool:
-        """Verilen maç sonucuna göre tercihin kazanıp kazanmadığını matematiksel olarak doğrular."""
-        p = pick.lower()
+    def get_market_family(signal_key: str, pick_str: str = "") -> str:
+        """
+        Her bir tercihi pazar ailesine (market family) ayırarak
+        kupon içi market çeşitliliğini (tek yönlü olmamasını) garanti eder.
+        """
+        p = pick_str.strip().lower()
+        if any(w in p for w in ["&", " ve ", "iyms", "iy/ms"]):
+            return "combos"
+        if any(w in p for w in ["kg var", "kg yok", "karşılıklı gol"]):
+            return "btts"
+        if any(w in p for w in ["iki yarıda", "ev sahibi 1.5", "deplasman 1.5", "ev sahibi 0.5", "deplasman 0.5"]):
+            return "team_goals"
+        if any(w in p for w in ["iy 1.5", "iy 0.5", "ilk yarı", "iy üst", "iy alt"]):
+            return "halves_goals"
+        if any(w in p for w in ["2-3 gol", "4-5 gol", "gol aralığı", "0-1 gol"]):
+            return "goal_range"
+        if "skor:" in p or "skor " in p or re.search(r"^\d+-\d+$", p):
+            return "exact_score"
+        if any(w in p for w in ["korner", "kart"]):
+            return "specials"
+        if any(w in p for w in ["üst", "alt"]):
+            return "over_under"
+        if any(w in p for w in ["ms 1", "ms 2", "ms x", "çifte şans", "1x", "x2", "12"]):
+            return "match_winner"
+        return "other"
+
+    @staticmethod
+    def evaluate_pick(
+        pick: str,
+        home_score: Optional[int],
+        away_score: Optional[int],
+        ht_home: Optional[int] = None,
+        ht_away: Optional[int] = None,
+    ) -> Optional[bool]:
+        """
+        Verilen maç sonucuna göre tercihin kazanıp kazanmadığını matematiksel olarak doğrular.
+        - True: Kesin Kazandı (WON)
+        - False: Kesin Kaybetti (LOST)
+        - None: Veri yetersizliği sebebiyle doğrulanmadı (UNVERIFIED - Korner, kart, İY verisi eksik vb.)
+        """
+        if home_score is None or away_score is None:
+            return None
+
+        p = pick.strip().lower()
         tot = home_score + away_score
-        if "ms 1" in p:
-            return home_score > away_score
-        elif "ms 2" in p:
-            return away_score > home_score
-        elif "ms x" in p:
-            return home_score == away_score
-        elif "2.5 gol üst" in p or "2.5 üst" in p:
-            return tot >= 3
-        elif "2.5 gol alt" in p or "2.5 alt" in p:
-            return tot < 3
-        elif "3.5 gol üst" in p or "3.5 üst" in p:
-            return tot >= 4
-        elif "kg var" in p:
-            return home_score >= 1 and away_score >= 1
-        elif "kg yok" in p:
-            return home_score == 0 or away_score == 0
-        elif "6+" in p or "+6" in p:
-            return tot >= 6
-        elif "2-3 gol" in p:
-            return 2 <= tot <= 3
-        elif "4-5 gol" in p:
-            return 4 <= tot <= 5
-        elif "ev sahibi" in p and "1.5 gol üst" in p:
-            return home_score >= 2
-        elif "deplasman" in p and "1.5 gol üst" in p:
-            return away_score >= 2
-        elif "skor:" in p:
+
+        # 1. Korner ve Kart Bahisleri (Skor verisinde kart/korner yoksa ASLA False/Lost dönmemeli)
+        if any(w in p for w in ["korner", "kart", "kırmızı"]):
+            return None
+
+        # 2. İki Yarıda da Gol Atar & İki Yarıda KG
+        if "iki yarıda da gol" in p or "iki yarıda kg" in p or "iki yarı kg" in p:
+            if ht_home is None or ht_away is None:
+                return None
+            sh2_home = home_score - ht_home
+            sh2_away = away_score - ht_away
+            if "ev sahibi" in p and "iki yarıda" in p:
+                return ht_home >= 1 and sh2_home >= 1
+            if "deplasman" in p and "iki yarıda" in p:
+                return ht_away >= 1 and sh2_away >= 1
+            if "iki yarıda kg" in p or "iki yarı kg" in p:
+                return (ht_home >= 1 and ht_away >= 1) and (sh2_home >= 1 and sh2_away >= 1)
+            return None
+
+        # 3. İY (İlk Yarı) Bahisleri
+        if "iy " in p or "ilk yarı" in p:
+            if ht_home is None or ht_away is None:
+                return None
+            ht_tot = ht_home + ht_away
+            if "1/2" in p:
+                return ht_home > ht_away and home_score < away_score
+            if "2/1" in p:
+                return ht_home < ht_away and home_score > away_score
+            if "x/1" in p or "0/1" in p:
+                return ht_home == ht_away and home_score > away_score
+            if "x/2" in p or "0/2" in p:
+                return ht_home == ht_away and home_score < away_score
+            if "1/1" in p:
+                return ht_home > ht_away and home_score > away_score
+            if "2/2" in p:
+                return ht_home < ht_away and home_score < away_score
+            if "1.5" in p and ("üst" in p or "over" in p):
+                return ht_tot >= 2
+            if "1.5" in p and ("alt" in p or "under" in p):
+                return ht_tot < 2
+            if "0.5" in p and ("üst" in p or "over" in p):
+                return ht_tot >= 1
+            if "0.5" in p and ("alt" in p or "under" in p):
+                return ht_tot == 0
+            return None
+
+        # 4. Kombine Bahisler (MS 1 & 2.5 Üst, KG Var & 2.5 Üst vb.)
+        if "&" in p or " ve " in p:
+            parts = [x.strip() for x in (p.split("&") if "&" in p else p.split(" ve "))]
+            sub_res = [MatchQuantitativeAnalyzer.evaluate_pick(part, home_score, away_score, ht_home, ht_away) for part in parts]
+            if any(sr is False for sr in sub_res):
+                return False
+            if all(sr is True for sr in sub_res):
+                return True
+            return None
+
+        # 5. Kesin Skor Sniper
+        if "skor:" in p or "skor " in p:
             m = re.search(r"(\d+)[\-_:](\d+)", p)
             if m:
                 return home_score == int(m.group(1)) and away_score == int(m.group(2))
-        return False
+
+        # 6. Çifte Şans
+        if "çifte şans" in p or "1x" in p or "x2" in p or "12" in p:
+            if "1x" in p:
+                return home_score >= away_score
+            if "x2" in p:
+                return away_score >= home_score
+            if "12" in p:
+                return home_score != away_score
+
+        # 7. Ev Sahibi / Deplasman Takım Golleri
+        if "ev sahibi" in p:
+            if "0.5" in p and "üst" in p:
+                return home_score >= 1
+            if "1.5" in p and "üst" in p:
+                return home_score >= 2
+            if "1.5" in p and "alt" in p:
+                return home_score < 2
+            if "2.5" in p and "üst" in p:
+                return home_score >= 3
+        if "deplasman" in p:
+            if "0.5" in p and "üst" in p:
+                return away_score >= 1
+            if "1.5" in p and "üst" in p:
+                return away_score >= 2
+            if "1.5" in p and "alt" in p:
+                return away_score < 2
+            if "2.5" in p and "üst" in p:
+                return away_score >= 3
+
+        # 8. KG Var / KG Yok
+        if "kg var" in p or "karşılıklı gol var" in p:
+            return home_score >= 1 and away_score >= 1
+        if "kg yok" in p or "karşılıklı gol yok" in p:
+            return home_score == 0 or away_score == 0
+
+        # 9. Toplam Gol Aralıkları
+        if "0-1" in p:
+            return tot <= 1
+        if "2-3" in p:
+            return 2 <= tot <= 3
+        if "4-5" in p:
+            return 4 <= tot <= 5
+        if "6+" in p or "+6" in p:
+            return tot >= 6
+
+        # 10. Toplam Gol Üst/Alt
+        if "1.5" in p and ("üst" in p or "over" in p):
+            return tot >= 2
+        if "1.5" in p and ("alt" in p or "under" in p):
+            return tot < 2
+        if "2.5" in p and ("üst" in p or "over" in p):
+            return tot >= 3
+        if "2.5" in p and ("alt" in p or "under" in p):
+            return tot < 3
+        if "3.5" in p and ("üst" in p or "over" in p):
+            return tot >= 4
+        if "3.5" in p and ("alt" in p or "under" in p):
+            return tot < 4
+        if "4.5" in p and ("üst" in p or "over" in p):
+            return tot >= 5
+        if "4.5" in p and ("alt" in p or "under" in p):
+            return tot < 5
+
+        # 11. Maç Sonu (MS 1, MS X, MS 2)
+        if "ms 1" in p or p == "1" or "maç sonucu 1" in p:
+            return home_score > away_score
+        if "ms 2" in p or p == "2" or "maç sonucu 2" in p:
+            return away_score > home_score
+        if "ms x" in p or "ms 0" in p or p in ("x", "0") or "beraberlik" in p:
+            return home_score == away_score
+
+        return None
 
     def scan_trap_matches(self, matches: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
         """
