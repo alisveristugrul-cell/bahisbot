@@ -349,10 +349,35 @@ class GlobalMatchDataFetcher:
             elif mtid == 529:
                 odds["iki_yari_15_ust"] = _get_odd(m, 1)
 
-            # 343: MS ve 2.5 Alt/Üst (4=MS1&Üst, 5=MSX&Üst, 6=MS2&Üst)
+            # 342: MS ve 1.5 Alt/Üst (4=MS1&1.5Üst, 6=MS2&1.5Üst)
+            elif mtid == 342 and abs(sov - 1.5) < 0.1:
+                odds["ms1_ve_15_ust"] = _get_odd(m, 4)
+                odds["ms2_ve_15_ust"] = _get_odd(m, 6)
+
+            # 343: MS ve 2.5 Alt/Üst (1=MS1&Alt, 3=MS2&Alt, 4=MS1&Üst, 6=MS2&Üst)
             elif mtid == 343 and abs(sov - 2.5) < 0.1:
+                odds["ms1_ve_25_alt"] = _get_odd(m, 1)
+                odds["ms2_ve_25_alt"] = _get_odd(m, 3)
                 odds["ms1_ve_25_ust"] = _get_odd(m, 4)
                 odds["ms2_ve_25_ust"] = _get_odd(m, 6)
+
+            # 272: MS ve 3.5 / 4.5 Alt/Üst
+            elif mtid == 272:
+                if abs(sov - 3.5) < 0.1:
+                    odds["ms1_ve_35_alt"] = _get_odd(m, 1)
+                    odds["ms2_ve_35_alt"] = _get_odd(m, 3)
+                    odds["ms1_ve_35_ust"] = _get_odd(m, 4)
+                    odds["ms2_ve_35_ust"] = _get_odd(m, 6)
+                elif abs(sov - 4.5) < 0.1:
+                    odds["ms1_ve_45_alt"] = _get_odd(m, 1)
+                    odds["ms2_ve_45_alt"] = _get_odd(m, 3)
+
+            # 268: Handikaplı Maç Sonucu (-1.0 ve +1.0)
+            elif mtid == 268:
+                if abs(sov - (-1.0)) < 0.1:
+                    odds["hms1_2fark"] = _get_odd(m, 1)
+                elif abs(sov - 1.0) < 0.1:
+                    odds["hms2_2fark"] = _get_odd(m, 3)
 
             # 446: 2.5 Alt/Üst ve KG (2=2.5 Üst & KG Var)
             elif mtid == 446 and abs(sov - 2.5) < 0.1:

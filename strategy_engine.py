@@ -1794,8 +1794,19 @@ class MatchQuantitativeAnalyzer:
         if any(w in p for w in ["korner", "kart", "kırmızı"]):
             return None
 
-        # 2. İki Yarıda da Gol Atar & İki Yarıda KG
+        # 2. Her İki Yarıda Gol Olur & İki Yarıda da Gol Atar
+        if "her iki yarıda gol olur" in p:
+            if tot < 2:
+                return False
+            if ht_home is not None and ht_away is not None:
+                ht_tot = ht_home + ht_away
+                sh_tot = tot - ht_tot
+                return ht_tot >= 1 and sh_tot >= 1
+            return None
+
         if "iki yarıda da gol" in p or "iki yarıda kg" in p or "iki yarı kg" in p:
+            if tot < 2:
+                return False
             if ht_home is None or ht_away is None:
                 return None
             sh2_home = home_score - ht_home
@@ -1808,8 +1819,14 @@ class MatchQuantitativeAnalyzer:
                 return (ht_home >= 1 and ht_away >= 1) and (sh2_home >= 1 and sh2_away >= 1)
             return None
 
-        # 3. İY (İlk Yarı) Bahisleri
-        if "iy " in p or "ilk yarı" in p:
+        # 3. İY (İlk Yarı) ve İY/MS Bahisleri
+        if "iy/ms" in p or "iy " in p or "ilk yarı" in p:
+            if "1/1" in p and home_score <= away_score:
+                return False
+            if "2/2" in p and away_score <= home_score:
+                return False
+            if "1.5" in p and ("üst" in p or "over" in p) and tot < 2:
+                return False
             if ht_home is None or ht_away is None:
                 return None
             ht_tot = ht_home + ht_away
@@ -1835,7 +1852,14 @@ class MatchQuantitativeAnalyzer:
                 return ht_tot == 0
             return None
 
-        # 4. Kombine Bahisler (MS 1 & 2.5 Üst, KG Var & 2.5 Üst vb.)
+        # 4. Handikaplı Maç Sonucu (En Az 2 Fark)
+        if "handikap" in p or "2 fark" in p:
+            if "ms 1" in p or "ev sahibi" in p:
+                return (home_score - away_score) >= 2
+            if "ms 2" in p or "deplasman" in p:
+                return (away_score - home_score) >= 2
+
+        # 5. Kombine Bahisler (MS 1 & 2.5 Üst, MS 1 & 1.5 Üst, KG Var & 2.5 Üst vb.)
         if "&" in p or " ve " in p:
             parts = [x.strip() for x in (p.split("&") if "&" in p else p.split(" ve "))]
             sub_res = [MatchQuantitativeAnalyzer.evaluate_pick(part, home_score, away_score, ht_home, ht_away) for part in parts]
@@ -1845,13 +1869,13 @@ class MatchQuantitativeAnalyzer:
                 return True
             return None
 
-        # 5. Kesin Skor Sniper
+        # 6. Kesin Skor Sniper
         if "skor:" in p or "skor " in p:
             m = re.search(r"(\d+)[\-_:](\d+)", p)
             if m:
                 return home_score == int(m.group(1)) and away_score == int(m.group(2))
 
-        # 6. Çifte Şans
+        # 7. Çifte Şans
         if "çifte şans" in p or "1x" in p or "x2" in p or "12" in p:
             if "1x" in p:
                 return home_score >= away_score
@@ -1860,7 +1884,7 @@ class MatchQuantitativeAnalyzer:
             if "12" in p:
                 return home_score != away_score
 
-        # 7. Ev Sahibi / Deplasman Takım Golleri
+        # 8. Ev Sahibi / Deplasman Takım Golleri
         if "ev sahibi" in p:
             if "0.5" in p and "üst" in p:
                 return home_score >= 1
@@ -1880,13 +1904,13 @@ class MatchQuantitativeAnalyzer:
             if "2.5" in p and "üst" in p:
                 return away_score >= 3
 
-        # 8. KG Var / KG Yok
+        # 9. KG Var / KG Yok
         if "kg var" in p or "karşılıklı gol var" in p:
             return home_score >= 1 and away_score >= 1
         if "kg yok" in p or "karşılıklı gol yok" in p:
             return home_score == 0 or away_score == 0
 
-        # 9. Toplam Gol Aralıkları
+        # 10. Toplam Gol Aralıkları
         if "0-1" in p:
             return tot <= 1
         if "2-3" in p:
@@ -1896,7 +1920,7 @@ class MatchQuantitativeAnalyzer:
         if "6+" in p or "+6" in p:
             return tot >= 6
 
-        # 10. Toplam Gol Üst/Alt
+        # 11. Toplam Gol Üst/Alt
         if "1.5" in p and ("üst" in p or "over" in p):
             return tot >= 2
         if "1.5" in p and ("alt" in p or "under" in p):
@@ -1914,7 +1938,7 @@ class MatchQuantitativeAnalyzer:
         if "4.5" in p and ("alt" in p or "under" in p):
             return tot < 5
 
-        # 11. Maç Sonu (MS 1, MS X, MS 2)
+        # 12. Maç Sonu (MS 1, MS X, MS 2)
         if "ms 1" in p or p == "1" or "maç sonucu 1" in p:
             return home_score > away_score
         if "ms 2" in p or p == "2" or "maç sonucu 2" in p:
@@ -1924,233 +1948,714 @@ class MatchQuantitativeAnalyzer:
 
         return None
 
-    def scan_trap_matches(self, matches: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+    def _extract_tactical_arsenal(self, match: Dict[str, Any], analyzed: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Piyasa ve halkın yoğun şekilde favoriye yüklendiği ancak modelin yüksek patlama/tuzak riski
-        öngördüğü maçları (Reverse Line Movement / Value Trap) tespit eder.
+        Bir maç için Bülten'de GERÇEKTEN AÇIK olan tüm taktiksel bahis ihtimallerini
+        (MS & Üst, MS & Alt, Ev/Dep Gol, Her İki Yarıda Gol, KG & Üst, 2-3 Gol, İY 1.5 Üst, HMS vb.)
+        Dixon-Coles 9x9 olasılık matrisinden gerçek olasılıklarıyla çıkarır.
+        YASAKLI BAHİSLER: +6 Gol, İki Yarı KG (Evet/Evet), 1/2-2/1 Sürpriz, Kesin Skor, Kart ve Korner!
         """
-        traps: List[Dict[str, Any]] = []
+        odds = match.get("odds", {})
+        mat = analyzed["score_matrix"]
+        tot_mat = sum(sum(r) for r in mat) or 1.0
+        lam_h = analyzed["lam_home"]
+        lam_a = analyzed["lam_away"]
+        lam_tot = analyzed["lam_total"]
+        lam_1h = analyzed["lam_1h"]
+        lam_2h = max(0.20, lam_tot - lam_1h)
+        p_draw = analyzed["probabilities"]["ms_x"] / 100.0
+        home_name = match["home"]
+        away_name = match["away"]
 
-        for m in matches:
-            odds = m.get("odds", {})
-            o_1 = odds.get("ms_1")
-            o_2 = odds.get("ms_2")
+        # Matris olasılık yardımcı fonksiyonu
+        def _m_prob(cond_fn) -> float:
+            s = 0.0
+            for h in range(9):
+                for a in range(9):
+                    if cond_fn(h, a):
+                        s += mat[h][a]
+            return min(0.92, max(0.02, s / tot_mat))
 
-            fav_is_home = None
-            fav_odd = None
-            if o_1 and 1.20 <= o_1 <= 1.68:
-                fav_is_home = True
-                fav_odd = o_1
-            elif o_2 and 1.20 <= o_2 <= 1.68:
-                fav_is_home = False
-                fav_odd = o_2
+        # Ham olasılıklar
+        p_ms1 = _m_prob(lambda h, a: h > a)
+        p_ms2 = _m_prob(lambda h, a: a > h)
+        p_ms1_o15 = _m_prob(lambda h, a: h > a and (h + a) >= 2)
+        p_ms2_o15 = _m_prob(lambda h, a: a > h and (h + a) >= 2)
+        p_ms1_o25 = _m_prob(lambda h, a: h > a and (h + a) >= 3)
+        p_ms2_o25 = _m_prob(lambda h, a: a > h and (h + a) >= 3)
+        p_ms1_u35 = _m_prob(lambda h, a: h > a and (h + a) <= 3)
+        p_ms2_u35 = _m_prob(lambda h, a: a > h and (h + a) <= 3)
+        p_ms1_u45 = _m_prob(lambda h, a: h > a and (h + a) <= 4)
+        p_ms2_u45 = _m_prob(lambda h, a: a > h and (h + a) <= 4)
+        p_ms1_o35 = _m_prob(lambda h, a: h > a and (h + a) >= 4)
+        p_ms2_o35 = _m_prob(lambda h, a: a > h and (h + a) >= 4)
+        p_kg_o25 = _m_prob(lambda h, a: h >= 1 and a >= 1 and (h + a) >= 3)
+        p_ms1_kg = _m_prob(lambda h, a: h > a and a >= 1)
+        p_ms2_kg = _m_prob(lambda h, a: a > h and h >= 1)
+        p_ev_o15 = _m_prob(lambda h, a: h >= 2)
+        p_dep_o15 = _m_prob(lambda h, a: a >= 2)
+        p_ev_o25 = _m_prob(lambda h, a: h >= 3)
+        p_dep_o25 = _m_prob(lambda h, a: a >= 3)
+        p_o25 = _m_prob(lambda h, a: (h + a) >= 3)
+        p_o35 = _m_prob(lambda h, a: (h + a) >= 4)
+        p_u25 = _m_prob(lambda h, a: (h + a) <= 2)
+        p_btts = _m_prob(lambda h, a: h >= 1 and a >= 1)
+        p_btts_no = _m_prob(lambda h, a: h == 0 or a == 0)
+        p_tg_23 = _m_prob(lambda h, a: 2 <= (h + a) <= 3)
+        p_tg_45 = _m_prob(lambda h, a: 4 <= (h + a) <= 5)
+        p_hms1 = _m_prob(lambda h, a: (h - a) >= 2)
+        p_hms2 = _m_prob(lambda h, a: (a - h) >= 2)
 
-            if fav_is_home is None or fav_odd is None:
+        # İlk Yarı / İkinci Yarı olasılıkları
+        p_1h_goal = 1.0 - math.exp(-lam_1h)
+        p_2h_goal = 1.0 - math.exp(-lam_2h)
+        p_both_halves_goal = p_1h_goal * p_2h_goal * 0.90
+        p_iy_o15 = (1.0 - (1.0 + lam_1h) * math.exp(-lam_1h)) * 0.94
+        p_ev_both_halves = (1.0 - math.exp(-lam_h * 0.44)) * (1.0 - math.exp(-lam_h * 0.56)) * 0.92
+        p_dep_both_halves = (1.0 - math.exp(-lam_a * 0.44)) * (1.0 - math.exp(-lam_a * 0.56)) * 0.92
+        p_iyms_11 = min(0.68, p_ms1 * (0.58 + min(0.18, (lam_h - lam_a) * 0.08))) if lam_h > lam_a else 0.15
+        p_iyms_22 = min(0.68, p_ms2 * (0.58 + min(0.18, (lam_a - lam_h) * 0.08))) if lam_a > lam_h else 0.15
+
+        raw_options = [
+            # (Market Ailesi, Tercih Metni, Oran, Model Olasılığı (0-1), Taktiksel Açıklama, Ek Koşul)
+            (
+                "ms_over",
+                "MS 1 & 1.5 Üst",
+                odds.get("ms1_ve_15_ust"),
+                p_ms1_o15,
+                f"Ev sahibi favori (λ={lam_h:.2f}) ve maçın en az 2 gole gitme olasılığı yüksek (%{p_ms1_o15*100:.1f}).",
+                p_ms1 >= 0.48 and lam_h >= 1.45,
+            ),
+            (
+                "ms_over",
+                "MS 2 & 1.5 Üst",
+                odds.get("ms2_ve_15_ust"),
+                p_ms2_o15,
+                f"Deplasman favori (λ={lam_a:.2f}) ve en az 2 golle kazanma olasılığı %{p_ms2_o15*100:.1f}.",
+                p_ms2 >= 0.48 and lam_a >= 1.45,
+            ),
+            (
+                "ms_over",
+                "MS 1 & 2.5 Üst",
+                odds.get("ms1_ve_25_ust"),
+                p_ms1_o25,
+                f"Ev sahibi baskılı hücum gücüyle (λ={lam_h:.2f}) maçı 2.5 Üst'e taşıyarak kazanır.",
+                p_ms1 >= 0.46 and lam_tot >= 2.50,
+            ),
+            (
+                "ms_over",
+                "MS 2 & 2.5 Üst",
+                odds.get("ms2_ve_25_ust"),
+                p_ms2_o25,
+                f"Deplasman üstün hücum temposuyla (λ={lam_a:.2f}) gollü galibiyete yakın.",
+                p_ms2 >= 0.46 and lam_tot >= 2.50,
+            ),
+            (
+                "ms_under",
+                "MS 1 & 3.5 Alt",
+                odds.get("ms1_ve_35_alt"),
+                p_ms1_u35,
+                f"Kontrollü favori taktiği: 1-0, 2-0, 2-1, 3-0 skorlarının tamamını kapsar (%{p_ms1_u35*100:.1f}).",
+                p_ms1 >= 0.48 and lam_tot <= 3.05,
+            ),
+            (
+                "ms_under",
+                "MS 2 & 3.5 Alt",
+                odds.get("ms2_ve_35_alt"),
+                p_ms2_u35,
+                f"Kontrollü deplasman galibiyeti: 0-1, 0-2, 1-2, 0-3 skorlarını kapsar (%{p_ms2_u35*100:.1f}).",
+                p_ms2 >= 0.48 and lam_tot <= 3.05,
+            ),
+            (
+                "ms_under",
+                "MS 1 & 4.5 Alt",
+                odds.get("ms1_ve_45_alt"),
+                p_ms1_u45,
+                f"Ev sahibi galibiyeti + 4.5 Alt güvenlik kalkanı (Model: %{p_ms1_u45*100:.1f}).",
+                p_ms1 >= 0.50 and lam_tot <= 3.40,
+            ),
+            (
+                "ms_under",
+                "MS 2 & 4.5 Alt",
+                odds.get("ms2_ve_45_alt"),
+                p_ms2_u45,
+                f"Deplasman galibiyeti + 4.5 Alt güvenlik kalkanı (Model: %{p_ms2_u45*100:.1f}).",
+                p_ms2 >= 0.50 and lam_tot <= 3.40,
+            ),
+            (
+                "btts_combo",
+                "KG Var & 2.5 Üst",
+                odds.get("kg_var_ve_25_ust"),
+                p_kg_o25,
+                f"Çift taraflı açık futbol (Ev λ={lam_h:.2f}, Dep λ={lam_a:.2f}); hem KG hem 2.5 Üst bir arada!",
+                lam_h >= 1.15 and lam_a >= 1.05 and lam_tot >= 2.65,
+            ),
+            (
+                "btts_combo",
+                "MS 1 & KG Var",
+                odds.get("ms1_ve_kg_var"),
+                p_ms1_kg,
+                f"Ev sahibi kazanır ancak konuk ekip de 1 gol bulur (2-1, 3-1, 3-2 senaryosu).",
+                p_ms1 >= 0.48 and lam_a >= 0.90,
+            ),
+            (
+                "btts_combo",
+                "MS 2 & KG Var",
+                odds.get("ms2_ve_kg_var"),
+                p_ms2_kg,
+                f"Deplasman kazanır ancak ev sahibi de skor üretir (1-2, 1-3 senaryosu).",
+                p_ms2 >= 0.48 and lam_h >= 0.90,
+            ),
+            (
+                "team_goals",
+                f"Ev Sahibi ({home_name}) 1.5 Gol Üst",
+                odds.get("ev_ust_15"),
+                p_ev_o15,
+                f"Beraberlik kalkanlı tercih: Maç 2-2 bitse bile {home_name} 2 gol attığında kazanır (λ_ev={lam_h:.2f}).",
+                lam_h >= 1.55,
+            ),
+            (
+                "team_goals",
+                f"Deplasman ({away_name}) 1.5 Gol Üst",
+                odds.get("dep_ust_15"),
+                p_dep_o15,
+                f"Beraberlik kalkanlı tercih: Maç 2-2 bitse bile {away_name} 2 gol attığında kazanır (λ_dep={lam_a:.2f}).",
+                lam_a >= 1.55,
+            ),
+            (
+                "team_goals",
+                f"Ev Sahibi ({home_name}) 2.5 Gol Üst",
+                odds.get("ev_ust_25"),
+                p_ev_o25,
+                f"Ağır hücum üstünlüğü: {home_name} gol beklentisi λ={lam_h:.2f} (3+ gol potansiyeli).",
+                lam_h >= 2.05,
+            ),
+            (
+                "team_goals",
+                f"Deplasman ({away_name}) 2.5 Gol Üst",
+                odds.get("dep_ust_25"),
+                p_dep_o25,
+                f"Ağır deplasman baskısı: {away_name} gol beklentisi λ={lam_a:.2f} (3+ gol potansiyeli).",
+                lam_a >= 2.05,
+            ),
+            (
+                "team_halves",
+                f"Ev Sahibi ({home_name}) Her İki Yarıda Gol Atar",
+                odds.get("ev_iki_yari_gol"),
+                p_ev_both_halves,
+                f"{home_name} yüksek hücum temposuyla (λ_ev={lam_h:.2f}) hem 1. yarıda hem 2. yarıda gol bulur.",
+                lam_h >= 1.85,
+            ),
+            (
+                "team_halves",
+                f"Deplasman ({away_name}) Her İki Yarıda Gol Atar",
+                odds.get("dep_iki_yari_gol"),
+                p_dep_both_halves,
+                f"{away_name} yüksek hücum temposuyla (λ_dep={lam_a:.2f}) hem 1. yarıda hem 2. yarıda gol bulur.",
+                lam_a >= 1.85,
+            ),
+            (
+                "halves_goals",
+                "Her İki Yarıda Gol Olur",
+                odds.get("iki_yari_gol_var"),
+                p_both_halves_goal,
+                f"Takım fark etmeksizin hem 1. yarıda hem 2. yarıda en az 1'er gol çıkar (λ_1Y={lam_1h:.2f}, λ_2Y={lam_2h:.2f}).",
+                lam_tot >= 2.75,
+            ),
+            (
+                "iy_over",
+                "İlk Yarı 1.5 Gol Üst",
+                odds.get("iy_ust_15"),
+                p_iy_o15,
+                f"Erken baskı ve yüksek ilk yarı temposu (λ_1Y={lam_1h:.2f}); ilk 45 dakikada 2+ gol.",
+                lam_1h >= 1.20,
+            ),
+            (
+                "goal_range",
+                "2-3 Gol Aralığı",
+                odds.get("tg_2_3"),
+                p_tg_23,
+                f"Altın Bant: 1-1, 2-0, 0-2, 2-1 ve 1-2 skorlarının tamamında kazanır (λ_toplam={lam_tot:.2f}).",
+                2.10 <= lam_tot <= 2.85,
+            ),
+            (
+                "goal_range",
+                "4-5 Gol Aralığı",
+                odds.get("tg_4_5"),
+                p_tg_45,
+                f"Yüksek tempolu maçta +6 gol riskine girmeden 4 veya 5 gol bandı (λ_toplam={lam_tot:.2f}).",
+                lam_tot >= 3.00,
+            ),
+            (
+                "over_under",
+                "2.5 Gol Üst",
+                odds.get("ust_25"),
+                p_o25,
+                f"Toplam gol beklentisi λ={lam_tot:.2f}; Dixon-Coles 3+ gol olasılığı %{p_o25*100:.1f}.",
+                lam_tot >= 2.60,
+            ),
+            (
+                "over_under",
+                "3.5 Gol Üst",
+                odds.get("ust_35"),
+                p_o35,
+                f"Gol fırtınası beklentisi (λ={lam_tot:.2f}); 4+ gol olasılığı yüksek.",
+                lam_tot >= 2.95,
+            ),
+            (
+                "over_under",
+                "2.5 Gol Alt",
+                odds.get("alt_25"),
+                p_u25,
+                f"Savunma duvarı (λ={lam_tot:.2f}); düşük tempolu maçta en fazla 2 gol çıkar.",
+                lam_tot <= 2.25,
+            ),
+            (
+                "btts",
+                "KG Var",
+                odds.get("kg_var"),
+                p_btts,
+                f"Dengeli hücum gücü (Ev λ={lam_h:.2f} / Dep λ={lam_a:.2f}); karşılıklı gol olasılığı %{p_btts*100:.1f}.",
+                lam_h >= 1.15 and lam_a >= 1.05,
+            ),
+            (
+                "btts",
+                "KG Yok",
+                odds.get("kg_yok"),
+                p_btts_no,
+                f"Tek taraflı veya kısır maç (En az bir takım gol atamaz: %{p_btts_no*100:.1f}).",
+                min(lam_h, lam_a) <= 0.78,
+            ),
+            (
+                "match_winner",
+                "MS 1",
+                odds.get("ms_1"),
+                p_ms1,
+                f"Beraberlik kalkanından geçmiş net ev sahibi üstünlüğü (Model: %{p_ms1*100:.1f}, Beraberlik riski sadece %{p_draw*100:.1f}).",
+                p_ms1 >= 0.53 and p_draw <= 0.265 and lam_h >= 1.60,
+            ),
+            (
+                "match_winner",
+                "MS 2",
+                odds.get("ms_2"),
+                p_ms2,
+                f"Beraberlik kalkanından geçmiş net deplasman üstünlüğü (Model: %{p_ms2*100:.1f}, Beraberlik riski sadece %{p_draw*100:.1f}).",
+                p_ms2 >= 0.53 and p_draw <= 0.265 and lam_a >= 1.60,
+            ),
+            (
+                "handicap",
+                f"Handikaplı MS 1 ({home_name} En Az 2 Fark)",
+                odds.get("hms1_2fark"),
+                p_hms1,
+                f"{home_name} ağır kalite farkıyla (λ_ev={lam_h:.2f} vs λ_dep={lam_a:.2f}) en az 2 farkla kazanır.",
+                (lam_h - lam_a) >= 1.05 and p_ms1 >= 0.62,
+            ),
+            (
+                "handicap",
+                f"Handikaplı MS 2 ({away_name} En Az 2 Fark)",
+                odds.get("hms2_2fark"),
+                p_hms2,
+                f"{away_name} ağır kalite farkıyla (λ_dep={lam_a:.2f} vs λ_ev={lam_h:.2f}) en az 2 farkla kazanır.",
+                (lam_a - lam_h) >= 1.05 and p_ms2 >= 0.62,
+            ),
+            (
+                "ht_ft_fav",
+                f"İY/MS 1/1 ({home_name} İlk Yarıdan İşi Bitirir)",
+                odds.get("iyms_1_1"),
+                p_iyms_11,
+                f"{home_name} maça baskılı başlayıp ilk yarıdan öne geçerek maçı kazanır.",
+                p_ms1 >= 0.60 and lam_h >= 1.80,
+            ),
+            (
+                "ht_ft_fav",
+                f"İY/MS 2/2 ({away_name} İlk Yarıdan İşi Bitirir)",
+                odds.get("iyms_2_2"),
+                p_iyms_22,
+                f"{away_name} maça baskılı başlayıp ilk yarıdan öne geçerek maçı kazanır.",
+                p_ms2 >= 0.60 and lam_a >= 1.80,
+            ),
+        ]
+
+        valid_tactics: List[Dict[str, Any]] = []
+        is_balanced_match = abs(lam_h - lam_a) < 0.75
+
+        for fam, pick_str, odd_val, prob_01, reason_str, is_ok in raw_options:
+            if not odd_val or not is_ok:
+                continue
+            odd_f = float(odd_val)
+            if not (1.35 <= odd_f <= 3.60):
+                continue
+            if prob_01 < 0.32:
                 continue
 
+            ev = (prob_01 * odd_f) - 1.0
+
+            # 🛡️ TARAF BAĞIMSIZ GÜVEN KALKANI:
+            # 2.5 Üst/Alt, KG Var, 2-3 Gol ve Takım Golleri maçın beraberlikle veya sürprizle bitme
+            # riskinden muaftır! Denk maçlarda taraf bahsi yerine gol/KG tercihi VASTLY daha garantidir.
+            is_side_independent = fam in ("over_under", "btts", "goal_range", "team_goals", "halves_goals", "iy_over")
+            side_bonus = 6.5 if is_side_independent else 0.0
+            if is_balanced_match:
+                if is_side_independent:
+                    side_bonus += 5.5  # Denk maçta Üst/Alt ve KG Var çok daha güvenli
+                elif fam in ("match_winner", "ms_over", "ms_under", "handicap", "ht_ft_fav"):
+                    side_bonus -= 6.0  # Denk maçta MS taraf tahmini gereksiz varyans ve yatma riski taşır
+
+            conf_score = (prob_01 * 100.0) * 0.80 + max(-8.0, min(18.0, ev * 45.0)) + side_bonus + 10.0
+            valid_tactics.append({
+                "family": fam,
+                "is_side_independent": is_side_independent,
+                "pick": pick_str,
+                "odd": round(odd_f, 2),
+                "prob": round(prob_01 * 100.0, 1),
+                "confidence": round(min(98.0, max(45.0, conf_score)), 1),
+                "ev_pct": round(ev * 100.0, 1),
+                "reasons": [reason_str],
+            })
+
+        valid_tactics.sort(key=lambda x: (x["confidence"], x["prob"]), reverse=True)
+        return valid_tactics
+
+    def build_sniper_4h_coupon(
+        self,
+        matches: List[Dict[str, Any]],
+        hours: int = 4,
+        target_odd: float = 20.0,
+        fixed_stake: float = 50.0,
+        elite_only: bool = False,
+        exclude_codes: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Verilen hedef oran (5.0, 10.0 veya 20.0) ve bahis tutarı (200 TL, 100 TL, 50 TL) için
+        EN AZ MAÇLA ve EN YÜKSEK ORTAK OLASILIKLA (Joint Probability) hedefi vuran kupon üretir.
+        - +6 Gol, İki Yarı KG (Evet/Evet), 1/2 Sürpriz, Kesin Skor, Kart ve Korner KESİNLİKLE YASAKTIR.
+        - MS & Üst, MS & Alt, Ev/Dep 1.5-2.5 Üst, Ev/Dep İki Yarıda Gol, Her İki Yarıda Gol, KG & Üst, 2-3 Gol gibi
+          tüm taktiksel silahları kullanır.
+        """
+        from datetime import datetime, timedelta
+        import itertools
+
+        now = datetime.now()
+        actual_hours = hours
+        window_matches: List[Dict[str, Any]] = []
+
+        for h_try in (hours, 6, 8, 12, 24):
+            limit_dt = now + timedelta(hours=h_try)
+            cands = [m for m in matches if now <= m.get("start_dt", now) <= limit_dt]
+            if exclude_codes:
+                cands = [m for m in cands if m.get("code") not in exclude_codes]
+            if elite_only:
+                elite_cands = [m for m in cands if self.classify_match_league_tier(m) in (1, 2)]
+                if len(elite_cands) >= 5:
+                    cands = elite_cands
+            if len(cands) >= 6 or h_try == 24:
+                window_matches = cands
+                actual_hours = h_try
+                break
+
+        limit_dt = now + timedelta(hours=actual_hours)
+
+        # Hedef Orana Göre Minimum Maç Sayısı ve İdeal Maç Başı Oran (En Az Maç Kuralı!)
+        if target_odd <= 6.5:
+            # 200 TL -> 5 Oran Kupon: SADECE 2 veya 3 MAÇ!
+            target_min, target_max = target_odd * 0.88, target_odd * 1.22
+            leg_options = (2, 3)
+            min_leg_odd, max_leg_odd = 1.48, 2.55
+            ideal_leg_odd = 1.75
+        elif target_odd <= 13.0:
+            # 100 TL -> 10 Oran Kupon: SADECE 3 veya 4 MAÇ!
+            target_min, target_max = target_odd * 0.88, target_odd * 1.22
+            leg_options = (3, 4)
+            min_leg_odd, max_leg_odd = 1.62, 2.85
+            ideal_leg_odd = 2.08
+        else:
+            # 50 TL -> 20 Oran Kupon: SADECE 3 veya 4 MAÇ (Asla 5+ maç yapmaz)!
+            target_min, target_max = target_odd * 0.86, target_odd * 1.25
+            leg_options = (3, 4)
+            min_leg_odd, max_leg_odd = 1.80, 3.50
+            ideal_leg_odd = 2.28
+
+        candidate_pool: List[Tuple[float, Dict[str, Any], Dict[str, Any], str, int]] = []
+
+        for m in window_matches:
             a = self.analyze_match(m)
-            p = a["probabilities"]
-            lam_h = a["lam_home"]
-            lam_a = a["lam_away"]
-            chaos = a["chaos_index"]
+            tier = self.classify_match_league_tier(m)
+            tier_bonus = 6.5 if tier == 1 else (3.5 if tier == 2 else -3.5)
+            in_strict_4h = (m.get("start_dt", now) <= now + timedelta(hours=hours))
+            time_bonus = 4.0 if in_strict_4h else 0.0
 
-            fav_name = m["home"] if fav_is_home else m["away"]
-            dog_name = m["away"] if fav_is_home else m["home"]
-            fav_prob = p["ms_1"] if fav_is_home else p["ms_2"]
-            fav_lam = lam_h if fav_is_home else lam_a
-            dog_lam = lam_a if fav_is_home else lam_h
+            tactics = self._extract_tactical_arsenal(m, a)
+            fams_best: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
-            implied_market_prob = (1.0 / fav_odd) * 100
-            prob_diff = implied_market_prob - fav_prob
-            trap_score = 0
-            reasons: List[str] = []
+            for tac in tactics:
+                odd = tac["odd"]
+                if not (min_leg_odd <= odd <= max_leg_odd):
+                    continue
+                fam = tac["family"]
+                # Hedef kupon oranına en uygun maç başı oranı ödüllendir (3-4 maçta hedefi tam vurmak için)
+                leg_fit_bonus = max(0.0, 22.0 - abs(odd - ideal_leg_odd) * 18.0)
+                sniper_score = (tac["confidence"] * 0.50) + (tac["prob"] * 0.40) + leg_fit_bonus + tier_bonus + time_bonus
+                if fam not in fams_best or sniper_score > fams_best[fam][0]:
+                    fams_best[fam] = (sniper_score, tac)
 
-            if prob_diff >= 6.0:
-                trap_score += int(min(35, prob_diff * 2.2))
-                reasons.append(
-                    f"Piyasa favoriye %{implied_market_prob:.1f} verirken, modelin gerçek kazanma ihtimali %{fav_prob:.1f} (Piyasa Şişirmesi: %{prob_diff:.1f} fark)"
+            # Her maçtan en iyi 3 farklı taktiksel marketi aday havuzuna ekle
+            sorted_fams = sorted(fams_best.items(), key=lambda x: x[1][0], reverse=True)[:3]
+            for fam, (sc, sig) in sorted_fams:
+                candidate_pool.append((sc, a, sig, fam, tier))
+
+        candidate_pool.sort(key=lambda x: x[0], reverse=True)
+        top_cands = candidate_pool[:30]
+
+        best_combo = None
+        best_obj_score = -1e9
+
+        for k in leg_options:
+            if len(top_cands) < k:
+                continue
+            for combo in itertools.combinations(top_cands, k):
+                # 1. Her maç farklı olmalı
+                codes = [item[1]["match"]["code"] for item in combo]
+                if len(set(codes)) != k:
+                    continue
+
+                # 2. Pazar çeşitliliği: Tek tip bahis YASAK!
+                fams = [item[3] for item in combo]
+                unique_fams = len(set(fams))
+                if k >= 3 and unique_fams < min(3, k):
+                    continue
+                # Aynı market ailesinden en fazla 1 adet (4 maçlıkta en fazla 2 adet) olabilir
+                max_same_fam = 1 if k <= 3 else 2
+                if any(fams.count(f_set) > max_same_fam for f_set in set(fams)):
+                    continue
+
+                # 3. Taraf Riski Dengesi: Asla tüm kupon maçları taraf (MS) bahsi olamaz!
+                # Kuponda mutlaka en az 1-2 adet taraf bağımsız (2.5 Üst/Alt, KG Var, 2-3 Gol, Takım Golü)
+                # maç bulunmalıdır. Çünkü denk maçlarda Üst/Alt ve KG Var taraf bahsinden çok daha garantidir!
+                side_indep_count = sum(1 for item in combo if item[2].get("is_side_independent"))
+                if side_indep_count == 0 and k >= 2:
+                    continue
+
+                tot_odd = 1.0
+                joint_prob = 1.0
+                min_prob = 100.0
+                avg_sniper = 0.0
+                for sc, a_item, sig, fam, tier in combo:
+                    tot_odd *= float(sig["odd"])
+                    p_val = float(sig["prob"])
+                    joint_prob *= (p_val / 100.0)
+                    if p_val < min_prob:
+                        min_prob = p_val
+                    avg_sniper += sc
+                avg_sniper /= k
+
+                if tot_odd < target_min * 0.82 or tot_odd > target_max * 1.25:
+                    continue
+
+                in_band = 1.0 if (target_min <= tot_odd <= target_max) else 0.0
+                log_dist = abs(math.log(max(1.0, tot_odd) / target_odd))
+
+                # EN AZ MAÇ & EN YÜKSEK OLASILIK ÖDÜLÜ
+                fewest_legs_bonus = (5 - k) * 14.0
+                # Taraf riski içermeyen garanti market ödülü (Üst/Alt, KG Var, vb.)
+                side_shield_bonus = side_indep_count * 10.0
+
+                obj_score = (
+                    (avg_sniper * 1.35)
+                    + (min_prob * 1.10)
+                    + (joint_prob * 100.0 * 2.8)
+                    + (in_band * 120.0)
+                    + (unique_fams * 14.0)
+                    + fewest_legs_bonus
+                    + side_shield_bonus
+                    - (log_dist * 195.0)
                 )
 
-            if dog_lam >= 1.05:
-                trap_score += 25
-                reasons.append(
-                    f"{dog_name} takımının gizli gol tehdidi yüksek (λ={dog_lam:.2f} gol). Favori savunması açık vermeye meyilli."
-                )
+                if obj_score > best_obj_score:
+                    best_obj_score = obj_score
+                    best_combo = (combo, tot_odd, joint_prob * 100.0, min_prob)
 
-            if chaos >= 50:
-                trap_score += 20
-                reasons.append(
-                    f"Maçın kaos ve değişkenlik endeksi yüksek ({chaos}/100); favorinin kaza yapma ihtimali kuvvetli."
-                )
+        # Fallback: Eğer katı aralıkta bulunamadıysa hedef orana logaritmik olarak en yakın ve çeşitli kombinasyonu seç
+        if not best_combo and top_cands:
+            for k in leg_options:
+                if len(top_cands) < k:
+                    continue
+                for combo in itertools.combinations(top_cands[:20], k):
+                    codes = [item[1]["match"]["code"] for item in combo]
+                    if len(set(codes)) != k:
+                        continue
+                    fams = [item[3] for item in combo]
+                    if len(set(fams)) < min(2, k):
+                        continue
+                    tot_odd = 1.0
+                    joint_prob = 1.0
+                    min_prob = 100.0
+                    for sc, a_item, sig, fam, tier in combo:
+                        tot_odd *= float(sig["odd"])
+                        p_val = float(sig["prob"])
+                        joint_prob *= (p_val / 100.0)
+                        min_prob = min(min_prob, p_val)
+                    log_dist = abs(math.log(max(1.0, tot_odd) / target_odd))
+                    fb_score = (joint_prob * 100.0 * 2.0) + (len(set(fams)) * 12.0) - (log_dist * 220.0)
+                    if fb_score > best_obj_score:
+                        best_obj_score = fb_score
+                        best_combo = (combo, tot_odd, joint_prob * 100.0, min_prob)
 
-            if fav_lam <= 1.55:
-                trap_score += 15
-                reasons.append(
-                    f"Favori {fav_name} takımının gol beklentisi kısıtlı (λ={fav_lam:.2f}); tek farklı skor veya puan kaybı riski var."
-                )
+        if not best_combo:
+            return {
+                "target_odd": target_odd,
+                "fixed_stake": fixed_stake,
+                "window_hours": actual_hours,
+                "start_time": now.strftime("%H:%M"),
+                "end_time": limit_dt.strftime("%H:%M"),
+                "match_count": len(window_matches),
+                "total_odd": 0.0,
+                "expected_payout": 0.0,
+                "picks": [],
+            }
 
-            if trap_score >= 50:
-                danger_level = "🚨 KRİTİK PATLAMA RİSKİ" if trap_score >= 70 else "⚠️ DİKKAT: TUZAK RİSKİ"
+        combo_items, tot_odd, joint_prob_pct, min_prob_val = best_combo
+        sorted_items = sorted(combo_items, key=lambda x: x[1]["match"].get("start_dt", now))
+        max_prob_code = max(sorted_items, key=lambda x: float(x[2]["prob"]))[1]["match"]["code"]
 
-                if dog_lam >= 1.15:
-                    anti_pick = f"Rakip ({dog_name}) 0.5 Gol Üst veya KG Var"
-                elif fav_is_home:
-                    anti_pick = f"Deplasman ({dog_name}) +1.5 Handikap veya X2 Çifte Şans"
-                else:
-                    anti_pick = f"Ev Sahibi ({dog_name}) +1.5 Handikap veya 1X Çifte Şans"
+        picks = []
+        for idx, (sc, a_item, sig, fam, tier) in enumerate(sorted_items):
+            m_obj = a_item["match"]
+            is_anchor = (m_obj["code"] == max_prob_code)
+            is_last_hedge = (idx == len(sorted_items) - 1 and len(sorted_items) >= 2)
 
-                traps.append({
-                    "match": m,
-                    "favorite": fav_name,
-                    "favorite_odd": fav_odd,
-                    "underdog": dog_name,
-                    "trap_score": min(98, trap_score),
-                    "danger_level": danger_level,
-                    "implied_market_prob": round(implied_market_prob, 1),
-                    "model_prob": round(fav_prob, 1),
-                    "reasons": reasons,
-                    "anti_pick": anti_pick,
-                })
+            role_badge = ""
+            if is_anchor:
+                role_badge = "⚓ KUPON ÇAPASI (En Yüksek Güven)"
+            elif is_last_hedge:
+                role_badge = "🛡️ SON MAÇ (Canlı Kâr Kilitleme Noktası)"
 
-        traps.sort(key=lambda x: x["trap_score"], reverse=True)
-        return traps[:top_n]
+            tier_str = "👑 Ana Lig" if tier == 1 else ("🥈 2. Kademe" if tier == 2 else "⚽ Bülten")
+            reason_str = sig["reasons"][0] if sig.get("reasons") else ""
+            top_sc_str = " | ".join(f"{s_code} (%{s_pr})" for s_code, s_pr in a_item.get("top_scores", [])[:3])
 
-    def scan_tension_matches(self, matches: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
-        """
-        Derbi, sert lig mücadeleleri ve yüksek tansiyonlu maçları tarar;
-        Kart ve korner baskısı yüksek mücadeleleri sinyaller.
-        """
-        high_tension_leagues = [
-            "türkiye", "super lig", "süper lig", "la liga", "segunda",
-            "serie a", "argentina", "copa libertadores", "greece",
-            "championship", "scotland", "poland", "serbia", "derby"
-        ]
+            picks.append({
+                "code": m_obj["code"],
+                "match": f"{m_obj['home']} - {m_obj['away']}",
+                "league": m_obj["league"],
+                "tier_label": tier_str,
+                "league_tier": tier,
+                "time": f"{m_obj['date']} {m_obj['time']}",
+                "pick": sig["pick"],
+                "odd": round(float(sig["odd"]), 2),
+                "prob": round(float(sig["prob"]), 1),
+                "ev_pct": round(float(sig.get("ev_pct", 0.0)), 1),
+                "lam_home": a_item.get("lam_home", "-"),
+                "lam_away": a_item.get("lam_away", "-"),
+                "top_scores": top_sc_str,
+                "confidence": round(float(sig.get("confidence", 0.0)), 1),
+                "family": fam,
+                "role_badge": role_badge,
+                "reason": reason_str,
+            })
 
-        tensions: List[Dict[str, Any]] = []
-
-        for m in matches:
-            a = self.analyze_match(m)
-            odds = m.get("odds", {})
-            league_lower = m.get("league", "").lower()
-            chaos = a["chaos_index"]
-
-            is_tension_league = any(tl in league_lower for tl in high_tension_leagues)
-            base_score = 45 if is_tension_league else 25
-
-            o_1 = odds.get("ms_1", 2.50)
-            o_2 = odds.get("ms_2", 2.50)
-            diff = abs(o_1 - o_2)
-            if diff < 1.2:
-                base_score += 25
-            elif diff < 2.0:
-                base_score += 15
-
-            base_score += int(chaos * 0.3)
-
-            exp_cards = round(3.8 + (base_score / 100.0) * 2.8, 1)
-            exp_corners = round(8.8 + (a["lam_total"] * 0.9), 1)
-
-            card_prob = min(88.0, 50.0 + (base_score * 0.4))
-            red_card_risk = min(40.0, 10.0 + (base_score * 0.3))
-
-            if base_score >= 60:
-                tensions.append({
-                    "match": m,
-                    "league": m.get("league", ""),
-                    "tension_score": min(98, base_score),
-                    "expected_cards": exp_cards,
-                    "expected_corners": exp_corners,
-                    "card_pick": "4.5 Üst Sarı Kart" if exp_cards >= 5.0 else "3.5 Üst Sarı Kart",
-                    "corner_pick": "9.5 Üst Korner" if exp_corners >= 10.0 else "8.5 Üst Korner",
-                    "card_prob": round(card_prob, 1),
-                    "red_card_risk": round(red_card_risk, 1),
-                    "reason": f"Sert mücadele endeksi (%{base_score}), başa baş maç dengesi ve lig karakteri yüksek kart baskısına işaret ediyor."
-                })
-
-        tensions.sort(key=lambda x: x["tension_score"], reverse=True)
-        return tensions[:top_n]
-
-    def run_monte_carlo_simulation(self, match: Dict[str, Any], n_sims: int = 10000) -> Dict[str, Any]:
-        """
-        Dixon-Coles ve Poisson parametrelerini kullanarak bir maçı 10.000 kez bilgisayarda simüle eder.
-        Kesin kazanma frekanslarını, gol limitlerini ve en sık çıkan kesin skorları hesaplar.
-        """
-        a = self.analyze_match(match)
-        score_matrix = a["score_matrix"]
-
-        scores: List[Tuple[int, int]] = []
-        cum_probs: List[float] = []
-        total_p = sum(sum(row) for row in score_matrix)
-        acc = 0.0
-
-        for h in range(9):
-            for aw in range(9):
-                p = score_matrix[h][aw] / total_p if total_p > 0 else 1.0 / 81.0
-                acc += p
-                cum_probs.append(acc)
-                scores.append((h, aw))
-        cum_probs[-1] = 1.0
-
-        home_wins = 0
-        draws = 0
-        away_wins = 0
-        over_15 = 0
-        over_25 = 0
-        over_35 = 0
-        btts = 0
-        tot_goals = 0
-        score_counts: Dict[Tuple[int, int], int] = {}
-
-        for _ in range(n_sims):
-            r = random.random()
-            idx = bisect.bisect_left(cum_probs, r)
-            if idx >= len(scores):
-                idx = len(scores) - 1
-            hg, ag = scores[idx]
-
-            if hg > ag:
-                home_wins += 1
-            elif hg == ag:
-                draws += 1
-            else:
-                away_wins += 1
-
-            tg = hg + ag
-            tot_goals += tg
-            if tg >= 2:
-                over_15 += 1
-            if tg >= 3:
-                over_25 += 1
-            if tg >= 4:
-                over_35 += 1
-            if hg > 0 and ag > 0:
-                btts += 1
-
-            score_counts[(hg, ag)] = score_counts.get((hg, ag), 0) + 1
-
-        top_scores = sorted(score_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_scores_formatted = [
-            {"score": f"{sc[0]}-{sc[1]}", "count": cnt, "pct": round(cnt / n_sims * 100, 1)}
-            for sc, cnt in top_scores
-        ]
+        total_odd_rounded = round(tot_odd, 2)
+        expected_payout = round(total_odd_rounded * fixed_stake, 2)
 
         return {
-            "match": f"{match['home']} vs {match['away']}",
-            "home": match["home"],
-            "away": match["away"],
-            "league": match.get("league", ""),
-            "date": match.get("date", ""),
-            "time": match.get("time", ""),
-            "n_sims": n_sims,
-            "home_win_pct": round(home_wins / n_sims * 100, 1),
-            "draw_pct": round(draws / n_sims * 100, 1),
-            "away_win_pct": round(away_wins / n_sims * 100, 1),
-            "over_15_pct": round(over_15 / n_sims * 100, 1),
-            "over_25_pct": round(over_25 / n_sims * 100, 1),
-            "over_35_pct": round(over_35 / n_sims * 100, 1),
-            "btts_pct": round(btts / n_sims * 100, 1),
-            "avg_goals": round(tot_goals / n_sims, 2),
-            "top_scores": top_scores_formatted,
-            "lambda_home": a["lam_home"],
-            "lambda_away": a["lam_away"],
+            "target_odd": target_odd,
+            "fixed_stake": fixed_stake,
+            "window_hours": actual_hours,
+            "elite_only": elite_only,
+            "start_time": now.strftime("%H:%M"),
+            "end_time": limit_dt.strftime("%H:%M"),
+            "match_count": len(window_matches),
+            "total_odd": total_odd_rounded,
+            "expected_payout": expected_payout,
+            "net_profit": round(expected_payout - fixed_stake, 2),
+            "joint_prob": round(joint_prob_pct, 1),
+            "min_leg_prob": round(min_prob_val, 1),
+            "picks": picks,
+        }
+
+    def build_trinity_4h_system(
+        self,
+        matches: List[Dict[str, Any]],
+        hours: int = 4,
+        elite_only: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Önümüzdeki 4 Saat İçin Kusursuz 3'lü Kupon Sistemi (Her Biri ~1.000 TL Hedefli):
+        1) 🟢 KUPON 1: 200 TL Yatırım ➔ ~5.00 Oran  (2-3 Maç | Hedef: ~1.000 TL)
+        2) 🟡 KUPON 2: 100 TL Yatırım ➔ ~10.00 Oran (3-4 Maç | Hedef: ~1.000 TL)
+        3) 🔴 KUPON 3: 50 TL Yatırım  ➔ ~20.00 Oran (3-4 Maç | Hedef: ~1.000 TL)
+
+        Özellikler:
+        - Kuponlar arası maç izolasyonu (Bir kupondaki maç diğer kupona yazılmaz; tek maç yatışı diğer kuponları etkilemez).
+        - +6 Gol, İki Yarı KG (Evet/Evet), 1/2 Sürpriz, Kart/Korner tamamen yasaklıdır.
+        - En az maç sayısı ve tüm taktiksel market kombinasyonları (MS&Üst, MS&Alt, Ev/Dep Gol, İki Yarıda Gol, 2-3 Gol vb.) kullanılır.
+        """
+        used_codes: Set[str] = set()
+
+        # 1. Kupon: 200 TL -> 5 Oran (En Az Maç: 2-3 Maç)
+        c_5x = self.build_sniper_4h_coupon(
+            matches,
+            hours=hours,
+            target_odd=5.0,
+            fixed_stake=200.0,
+            elite_only=elite_only,
+            exclude_codes=used_codes,
+        )
+        c_5x["title"] = "🟢 1. KUPON: 200 ₺ ➔ 5 ORAN KUPONU (Hedef: ~1.000 ₺)"
+        c_5x["subtitle"] = "En az maçla (2-3 maç), en yüksek olasılıklı taktiksel ana kasa kuponu."
+        for p in c_5x.get("picks", []):
+            if p.get("code"):
+                used_codes.add(p["code"])
+
+        # 2. Kupon: 100 TL -> 10 Oran (En Az Maç: 3-4 Maç)
+        c_10x = self.build_sniper_4h_coupon(
+            matches,
+            hours=hours,
+            target_odd=10.0,
+            fixed_stake=100.0,
+            elite_only=elite_only,
+            exclude_codes=used_codes,
+        )
+        c_10x["title"] = "🟡 2. KUPON: 100 ₺ ➔ 10 ORAN KUPONU (Hedef: ~1.000 ₺)"
+        c_10x["subtitle"] = "Farklı maçlardan oluşan, MS&Üst / Takım Golü / 2-3 Gol odaklı orta çarpan kuponu."
+        for p in c_10x.get("picks", []):
+            if p.get("code"):
+                used_codes.add(p["code"])
+
+        # 3. Kupon: 50 TL -> 20 Oran (En Az Maç: 3-4 Maç)
+        c_20x = self.build_sniper_4h_coupon(
+            matches,
+            hours=hours,
+            target_odd=20.0,
+            fixed_stake=50.0,
+            elite_only=elite_only,
+            exclude_codes=used_codes,
+        )
+        c_20x["title"] = "🔴 3. KUPON: 50 ₺ ➔ 20 ORAN KUPONU (Hedef: ~1.000 ₺)"
+        c_20x["subtitle"] = "En fazla 4 maçla 20 oranı vuran, +6 gol ve fantezi bahislerden arındırılmış keskin nişancı kuponu."
+
+        total_stake = 200.0 + 100.0 + 50.0
+        total_potential = round(
+            c_5x.get("expected_payout", 0.0)
+            + c_10x.get("expected_payout", 0.0)
+            + c_20x.get("expected_payout", 0.0),
+            2,
+        )
+
+        return {
+            "window_hours": max(
+                c_5x.get("window_hours", hours),
+                c_10x.get("window_hours", hours),
+                c_20x.get("window_hours", hours),
+            ),
+            "start_time": c_5x.get("start_time", ""),
+            "end_time": c_5x.get("end_time", ""),
+            "match_count": c_5x.get("match_count", 0),
+            "elite_only": elite_only,
+            "total_stake": total_stake,
+            "total_potential": total_potential,
+            "coupons": {
+                "kupon_5x": c_5x,
+                "kupon_10x": c_10x,
+                "kupon_20x": c_20x,
+            },
         }
