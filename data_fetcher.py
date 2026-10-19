@@ -314,6 +314,16 @@ class GlobalMatchDataFetcher:
             elif mtid == 328 and abs(sov - 2.5) < 0.1:
                 odds["dep_ust_25"] = _get_odd(m, 2)
 
+            # 455: 1. Yarı Ev Sahibi 0.5 Alt / Üst (Taktik 1: Ajan P için kritik)
+            elif mtid == 455 and abs(sov - 0.5) < 0.1:
+                odds["iy_ev_alt_05"] = _get_odd(m, 1)
+                odds["iy_ev_ust_05"] = _get_odd(m, 2)
+
+            # 457: 1. Yarı Deplasman 0.5 Alt / Üst (Taktik 1: Ajan P için kritik)
+            elif mtid == 457 and abs(sov - 0.5) < 0.1:
+                odds["iy_dep_alt_05"] = _get_odd(m, 1)
+                odds["iy_dep_ust_05"] = _get_odd(m, 2)
+
             # 38: Karşılıklı Gol (KG Var / KG Yok)
             elif mtid == 38:
                 odds["kg_var"] = _get_odd(m, 1)

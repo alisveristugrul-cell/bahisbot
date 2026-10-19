@@ -524,9 +524,47 @@ class BettingBotFormatter:
 
         return "\n".join(lines)
 
+    def format_tactic_scan(self, tactic_key: str) -> str:
+        """Kullanıcının gönderdiği Taktik 1 veya Taktik 2 için bülteni tarayıp eşleşen maçları listeler."""
+        matches = self.get_matches()
+        meta = self.analyzer.STRATEGY_METADATA.get(tactic_key, {})
+        picks = self.analyzer.scan_bulletin(matches, tactic_key, top_n=8)
+
+        t_title = _safe_html(meta.get("title", tactic_key.upper()))
+        t_desc = _safe_html(meta.get("desc", ""))
+
+        lines = [
+            f"<b>{t_title}</b>",
+            f"<i>{t_desc}</i>",
+            f"📊 <b>Taranan Aktif Maç:</b> {len(matches)} | <b>Bulunan Eşleşme:</b> {len(picks)}",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if not picks:
+            lines.append("⚠️ Şu anki bültende bu taktiğin oran kurallarını tam karşılayan maç bulunamadı.")
+            lines.append("💡 <i>Bülten yenilendikçe maçlar otomatik taranmaya devam eder.</i>")
+            return "\n".join(lines)
+
+        for idx, item in enumerate(picks, 1):
+            a = item["analysis"]
+            m = a["match"]
+            s = item["signal"]
+            top_sc = ", ".join(f"{sc} (%{pr})" for sc, pr in a["top_scores"][:2])
+            lines.append(
+                f"<b>{idx}) ⚽ {_safe_html(m['home'])} - {_safe_html(m['away'])}</b>\n"
+                f"   🏆 {_safe_html(m['league'])} | 🕒 <b>{m['date']} {m['time']}</b> | Kod: <code>#{m['code']}</code>\n"
+                f"   👉 <b>Tahmin:</b> <b>{_safe_html(s['pick'])}</b>  —  💰 <b>Oran: {s['odd']:.2f}</b>\n"
+                f"   📈 <b>Model Güveni:</b> %{s['confidence']:.1f} (İhtimal: %{s['prob']:.1f})\n"
+                f"   🧮 <b>xG:</b> Ev {a['lam_home']} - Dep {a['lam_away']} | 🎲 <b>Skor:</b> {top_sc}\n"
+                f"   📌 <i>{'; '.join(_safe_html(r) for r in s['reasons'])}</i>"
+            )
+            lines.append("──────────────────────")
+
+        return "\n".join(lines)
+
 
 class TelegramBettingBot:
-    """Sadece 4 Saatlik 3'lü Sniper Sistemine (200₺ 5x | 100₺ 10x | 50₺ 20x) odaklanmış Telegram Bot İstemcisi."""
+    """Sadece 4 Saatlik 3'lü Sniper Sistemine (200₺ 5x | 100₺ 10x | 50₺ 20x) ve Özel Taktiklere odaklanmış Telegram Bot İstemcisi."""
 
     STRATEGY_BUTTONS = [
         [
@@ -534,6 +572,10 @@ class TelegramBettingBot:
         ],
         [
             {"text": "👑 Sadece Ana Ligler (Lig 1): 4 Saatlik 3'lü Sistem", "callback_data": "action:trinity_elite"},
+        ],
+        [
+            {"text": "🎯 Taktik 1: İY 0.5 & 1.5 Üst", "callback_data": "action:taktik_1"},
+            {"text": "💣 Taktik 2: 0-1 vs 6+ Eşitliği", "callback_data": "action:taktik_2"},
         ],
         [
             {"text": "🟢 200 TL ➔ 5 Oran Kupon", "callback_data": "action:pillar_5"},
@@ -661,6 +703,17 @@ class TelegramBettingBot:
         elif cmd in ("/alternatif", "/alt"):
             self.send_message(chat_id, self.formatter.format_trinity_system(hours=4, elite_only=False, alt_mode=True), show_menu=True)
 
+        elif cmd in ("/taktik1", "/t1", "/ajanp"):
+            self.send_message(chat_id, self.formatter.format_tactic_scan("taktik_1"), show_menu=True)
+
+        elif cmd in ("/taktik2", "/t2", "/parliamentnb"):
+            self.send_message(chat_id, self.formatter.format_tactic_scan("taktik_2"), show_menu=True)
+
+        elif cmd in ("/taktikler", "/ozeltaktik"):
+            t1_text = self.formatter.format_tactic_scan("taktik_1")
+            t2_text = self.formatter.format_tactic_scan("taktik_2")
+            self.send_message(chat_id, [t1_text, t2_text], show_menu=True)
+
         elif cmd in ("/5", "/5oran", "/200"):
             self.send_message(chat_id, self.formatter.format_single_pillar(target_odd=5.0, stake_tl=200, hours=4), show_menu=True)
 
@@ -691,6 +744,8 @@ class TelegramBettingBot:
         commands = [
             {"command": "sistem", "description": "🔥 4 Saatlik 3'lü Sistem (200₺ 5x | 100₺ 10x | 50₺ 20x)"},
             {"command": "analig", "description": "👑 Sadece Ana Ligler (Lig 1): 4 Saatlik 3'lü Sistem"},
+            {"command": "taktik1", "description": "🎯 Taktik 1: İY 0.5 & 1.5 Üst Eşitliği (2.5 & 3.5 Üst)"},
+            {"command": "taktik2", "description": "💣 Taktik 2: 0-1 vs 6+ Eşitliği (2.5 & 3.5 Üst)"},
             {"command": "5", "description": "🟢 200 TL ➔ 5 Oran Kupon (2-3 Maç)"},
             {"command": "10", "description": "🟡 100 TL ➔ 10 Oran Kupon (3-4 Maç)"},
             {"command": "20", "description": "🔴 50 TL ➔ 20 Oran Sniper Kupon (3-4 Maç)"},
@@ -776,6 +831,10 @@ class TelegramBettingBot:
                             self.send_message(chat_id, self.formatter.format_trinity_system(hours=4, elite_only=True), show_menu=True)
                         elif data == "action:trinity_alt":
                             self.send_message(chat_id, self.formatter.format_trinity_system(hours=4, elite_only=False, alt_mode=True), show_menu=True)
+                        elif data == "action:taktik_1":
+                            self.send_message(chat_id, self.formatter.format_tactic_scan("taktik_1"), show_menu=True)
+                        elif data == "action:taktik_2":
+                            self.send_message(chat_id, self.formatter.format_tactic_scan("taktik_2"), show_menu=True)
                         elif data == "action:pillar_5":
                             self.send_message(chat_id, self.formatter.format_single_pillar(target_odd=5.0, stake_tl=200, hours=4), show_menu=True)
                         elif data == "action:pillar_10":
